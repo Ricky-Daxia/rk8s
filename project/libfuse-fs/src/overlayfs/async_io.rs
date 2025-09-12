@@ -472,7 +472,7 @@ impl Filesystem for OverlayFs {
             let rh = if let Some(ref h) = hd.real_handle {
                 h
             } else {
-                return Err(Error::other("no handle").into());
+                return Err(Error::other(format!("no real handle found for file handle {}", fh)).into());
             };
             let real_handle = rh.handle.load(Ordering::Relaxed);
             let real_inode = rh.inode;
@@ -745,7 +745,7 @@ impl Filesystem for OverlayFs {
             let rh = if let Some(ref h) = hd.real_handle {
                 h
             } else {
-                return Err(Error::other("no handle").into());
+                return Err(Error::other(format!("no real handle found for file handle {}", fh)).into());
             };
             let real_handle = rh.handle.load(Ordering::Relaxed);
             let real_inode = rh.inode;
