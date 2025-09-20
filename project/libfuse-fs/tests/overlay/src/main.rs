@@ -1,0 +1,135 @@
+#[derive(Debug, Default)]
+struct Args {
+    name: String,
+    mountpoint: String,
+    lowerdir: Vec<String>,
+    upperdir: String,
+    workdir: String,
+    log_level: String,
+}
+
+fn help() {
+    println!(
+        "Usage:\n   overlay -o lowerdir=<lower1>:<lower2>:<more>,upperdir=<upper>,workdir=<work> <name> <mountpoint> [-l log_level]\n"
+    );
+}
+
+fn parse_args() -> Result<Args, std::io::Error> {
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.len() < 5 {
+        help();
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+
+    let mut cmd_args = Args {
+        name: "".to_string(),
+        mountpoint: "".to_string(),
+        ..Default::default()
+    };
+
+    let mut i = 0;
+    loop {
+        i += 1;
+        if i >= args.len() {
+            break;
+        }
+        if args[i].as_str() == "-h" {
+            help();
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        if args[i].as_str() == "-o" {
+            i += 1;
+            let option = args[i].clone();
+            option.split(",").for_each(|value| {
+                let kv = value.split("=").collect::<Vec<&str>>();
+                if kv.len() != 2 {
+                    println!("Unknown option: {}", value);
+                    return;
+                }
+
+                match kv[0] {
+                    "lowerdir" => {
+                        cmd_args.lowerdir = kv[1].split(":").map(|s| s.to_string()).collect();
+                    }
+                    "upperdir" => {
+                        cmd_args.upperdir = kv[1].to_string();
+                    }
+                    "workdir" => {
+                        cmd_args.workdir = kv[1].to_string();
+                    }
+                    _ => {
+                        println!("Unknown option: {}", kv[0]);
+                    }
+                }
+            });
+            continue;
+        }
+
+        if args[i].as_str() == "-l" {
+            i += 1;
+            cmd_args.log_level = args[i].clone();
+        }
+
+        if cmd_args.name.is_empty() {
+            cmd_args.name = args[i].clone();
+            continue;
+        } else if cmd_args.mountpoint.is_empty() {
+            cmd_args.mountpoint = args[i].clone();
+            continue;
+        }
+    }
+
+    if cmd_args.lowerdir.is_empty() || cmd_args.upperdir.is_empty() || cmd_args.workdir.is_empty() {
+        println!("lowerdir, upperdir and workdir must be specified");
+        help();
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    Ok(cmd_args)
+}
+
+fn set_log(args: &Args) {
+    let log_level = match args.log_level.as_str() {
+        "error" => log::LevelFilter::Error,
+        "warn" => log::LevelFilter::Warn,
+        "info" => log::LevelFilter::Info,
+        "debug" => log::LevelFilter::Debug,
+        "trace" => log::LevelFilter::Trace,
+        _ => log::LevelFilter::Info,
+    };
+    env_logger::Builder::new()
+        .filter(None, log_level)
+        .init();
+}
+
+#[tokio::main]
+async fn main() -> Result<(), std::io::Error> {
+    let args = parse_args()?;
+
+    set_log(&args);
+
+    let mut mount_handle = libfuse_fs::overlayfs::mount_fs_for_test(
+        args.mountpoint,
+        args.upperdir,
+        args.lowerdir,
+        true,
+        args.name,
+    )
+    .await;
+    println!("Mounted");
+
+    let handle = &mut mount_handle;
+
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+    
+    tokio::select! {
+        res = handle => res?,
+        _ = sigint.recv() => mount_handle.unmount().await?,
+        _ = sigterm.recv() => mount_handle.unmount().await?,
+        _ = sighup.recv() => mount_handle.unmount().await?,
+    }
+
+    Ok(())
+}
