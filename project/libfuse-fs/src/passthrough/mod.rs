@@ -650,7 +650,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let st = statx::statx(&path_file, None)?;
 
         let btime_is_valid = match st.btime {
-            Some(ts) => ts.tv_sec != 0 && ts.tv_nsec != 0,
+            Some(ts) => ts.tv_sec != 0 || ts.tv_nsec != 0,
             None => false,
         };
 
@@ -877,8 +877,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 {
                     if new == 0 {
                         if data.handle.file_handle().is_some()
-                            && data.btime.tv_sec != 0
-                            && data.btime.tv_nsec != 0
+                            && (data.btime.tv_sec != 0 || data.btime.tv_nsec != 0)
                         {
                             let key = FileUniqueKey(data.id.ino, data.btime);
                             let cache = self.handle_cache.clone();

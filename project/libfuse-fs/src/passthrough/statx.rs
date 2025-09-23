@@ -7,7 +7,7 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::io::AsRawFd;
 
-use libc::statx_timestamp;
+use libc::{STATX_BTIME, statx_timestamp};
 
 use super::{
     EMPTY_CSTR,
@@ -125,7 +125,7 @@ pub fn statx(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<StatExt> {
         dir.as_raw_fd(),
         path.as_ptr(),
         libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-        STATX_BASIC_STATS | STATX_MNT_ID,
+        STATX_BASIC_STATS | STATX_MNT_ID | STATX_BTIME,
         stx_ui.as_mut_ptr(),
     );
     if res >= 0 {
