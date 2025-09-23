@@ -153,7 +153,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 let _entry = self.do_lookup(inode, &name).await?;
                 let mut inodes = self.inode_map.inodes.write().await;
 
-                self.forget_one(&mut inodes, _entry.attr.ino, 1);
+                self.forget_one(&mut inodes, _entry.attr.ino, 1).await;
                 entry.inode = _entry.attr.ino;
                 entry_list.push(Ok(entry));
 
@@ -341,8 +341,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::unlinkat(file.as_raw_fd(), name.as_ptr(), flags) };
         if res == 0 {
-            if flags & libc::AT_REMOVEDIR == 0
-                && let Some(st) = st
+            if let Some(st) = st
                 && let Some(btime) = st.btime
             {
                 let key = FileUniqueKey(st.st.st_ino, btime);
@@ -445,7 +444,7 @@ impl Filesystem for PassthroughFs {
     async fn forget(&self, _req: Request, inode: Inode, nlookup: u64) {
         let mut inodes = self.inode_map.inodes.write().await;
 
-        self.forget_one(&mut inodes, inode, nlookup)
+        self.forget_one(&mut inodes, inode, nlookup).await
     }
 
     /// get file attributes. If `fh` is None, means `fh` is not set.
@@ -1440,7 +1439,7 @@ impl Filesystem for PassthroughFs {
         let mut inodes_w = self.inode_map.inodes.write().await;
 
         for i in inodes {
-            self.forget_one(&mut inodes_w, i.0, i.1);
+            self.forget_one(&mut inodes_w, i.0, i.1).await;
         }
     }
 

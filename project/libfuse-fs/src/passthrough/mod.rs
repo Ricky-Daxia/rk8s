@@ -172,16 +172,25 @@ pub struct InodeData {
     refcount: AtomicU64,
     // File type and mode
     mode: u32,
+    btime: statx_timestamp,
 }
 
 impl InodeData {
-    fn new(inode: Inode, f: InodeHandle, refcount: u64, id: InodeId, mode: u32) -> Self {
+    fn new(
+        inode: Inode,
+        f: InodeHandle,
+        refcount: u64,
+        id: InodeId,
+        mode: u32,
+        btime: statx_timestamp,
+    ) -> Self {
         InodeData {
             inode,
             handle: f,
             id,
             refcount: AtomicU64::new(refcount),
             mode,
+            btime,
         }
     }
 
@@ -239,7 +248,6 @@ impl InodeMap {
     ) -> Option<Arc<InodeData>> {
         inodes
             .get_by_handle(handle)
-            .or_else(|| inodes.get_by_id(id))
             .or_else(|| {
                 inodes.get_by_id(id).filter(|data| {
                     // When we have to fall back to looking up an inode by its IDs, ensure that
@@ -250,7 +258,11 @@ impl InodeMap {
                     // inode ID.
                     // (This can happen when we look up a new file that has reused the inode ID
                     // of some previously unlinked inode we still have in `.inodes`.)
-                    data.handle.file_handle().is_none()
+                    let res = data.handle.file_handle().is_none();
+                    if !res {
+                        println!("?????");
+                    }
+                    res
                 })
             })
             .cloned()
@@ -355,7 +367,7 @@ impl HandleMap {
     }
 }
 
-#[derive(Hash, Eq, PartialEq)]
+#[derive(Debug, Hash, Eq, PartialEq)]
 struct FileUniqueKey(u64, statx_timestamp);
 
 /// A file system that simply "passes through" all requests it receives to the underlying file
@@ -536,6 +548,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 2,
                 id,
                 st.st.st_mode,
+                st.btime.unwrap(),
             )))
             .await;
 
@@ -636,33 +649,37 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let path_file = self.open_file_restricted(dir, name, libc::O_PATH, 0)?;
         let st = statx::statx(&path_file, None)?;
 
-        let key = FileUniqueKey(st.st.st_ino, st.btime.unwrap());
-        let handle_arc = {
+        let btime_is_valid = match st.btime {
+            Some(ts) => ts.tv_sec != 0 && ts.tv_nsec != 0,
+            None => false,
+        };
+
+        if btime_is_valid {
+            let key = FileUniqueKey(st.st.st_ino, st.btime.unwrap());
             let cache = self.handle_cache.clone();
             if let Some(h) = cache.get(&key).await {
-                h
+                Ok((h, st))
             } else if let Some(handle_from_fd) = FileHandle::from_fd(&path_file)? {
                 let handle_arc = Arc::new(handle_from_fd);
                 cache.insert(key, Arc::clone(&handle_arc)).await;
-                handle_arc
+                Ok((handle_arc, st))
             } else {
-                return Err(Error::new(
+                Err(Error::new(
                     io::ErrorKind::NotFound,
                     "Failed to create file handle",
-                ));
+                ))
             }
-        };
-
-        // let handle = {
-        //     if let Some(handle_from_fd) = FileHandle::from_fd(&path_file)? {
-        //         handle_from_fd
-        //     } else {
-        //         return Err(Error::new(io::ErrorKind::NotFound, "File not found"));
-        //     }
-        // };
-        // let handle_arc = Arc::new(handle);
-
-        Ok((handle_arc, st))
+        } else {
+            let handle = {
+                if let Some(handle_from_fd) = FileHandle::from_fd(&path_file)? {
+                    handle_from_fd
+                } else {
+                    return Err(Error::new(io::ErrorKind::NotFound, "File not found"));
+                }
+            };
+            let handle_arc = Arc::new(handle);
+            Ok((handle_arc, st))
+        }
     }
 
     fn to_openable_handle(&self, fh: Arc<FileHandle>) -> io::Result<Arc<OpenableFileHandle>> {
@@ -724,8 +741,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let dir_file = dir.get_file()?;
         let (handle_arc, st) = self.open_file_and_handle(&dir_file, name).await?;
         let id = InodeId::from_stat(&st);
-        // trace!("do_lookup: parent: {}, name: {}, path_fd: {:?}, handle_opt: {:?}, id: {:?}",
-        //     parent, name.to_string_lossy(), path_fd.as_raw_fd(), handle_opt, id);
+        // println!("do_lookup: parent: {}, name: {}, handle_arc: {:?}, id: {:?}",
+        //     parent, name.to_string_lossy(), handle_arc, id);
 
         let mut found = None;
         'search: loop {
@@ -793,7 +810,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
                     InodeMap::insert_locked(
                         inodes.deref_mut(),
-                        Arc::new(InodeData::new(inode, handle_clone, 1, id, st.st.st_mode)),
+                        Arc::new(InodeData::new(
+                            inode,
+                            handle_clone,
+                            1,
+                            id,
+                            st.st.st_mode,
+                            st.btime.unwrap(),
+                        )),
                     );
 
                     inode
@@ -827,7 +851,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         })
     }
 
-    fn forget_one(&self, inodes: &mut InodeStore, inode: Inode, count: u64) {
+    async fn forget_one(&self, inodes: &mut InodeStore, inode: Inode, count: u64) {
         // ROOT_ID should not be forgotten, or we're not able to access to files any more.
         if inode == ROOT_ID {
             return;
@@ -852,6 +876,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                     .is_ok()
                 {
                     if new == 0 {
+                        if data.handle.file_handle().is_some()
+                            && data.btime.tv_sec != 0
+                            && data.btime.tv_nsec != 0
+                        {
+                            let key = FileUniqueKey(data.id.ino, data.btime);
+                            let cache = self.handle_cache.clone();
+                            cache.invalidate(&key).await;
+                        }
                         // We just removed the last refcount for this inode.
                         // The allocated inode number should be kept in the map when use_host_ino
                         // is false or host inode(don't use the virtual 56bit inode) is bigger than MAX_HOST_INO.

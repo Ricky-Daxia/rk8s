@@ -133,8 +133,10 @@ impl Debug for CFileHandle {
         let fh = self.wrapper.as_fam_struct_ref();
         write!(
             f,
-            "File handle: type {}, len {}",
-            fh.handle_type, fh.handle_bytes
+            "File handle: type {}, len {}, inner {:?}",
+            fh.handle_type,
+            fh.handle_bytes,
+            fh.f_handle.as_slice(fh.handle_bytes as usize)
         )
     }
 }
