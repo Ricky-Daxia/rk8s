@@ -152,51 +152,7 @@ mod test {
     use super::super::*;
     use super::*;
 
-    use std::mem::MaybeUninit;
-    use std::os::unix::io::AsRawFd;
     use vmm_sys_util::tempfile::TempFile;
-
-    // impl PartialEq for InodeData {
-    //     asyncfn eq(&self, other: &Self) -> bool {
-    //         let self_count = *self.refcount.lock().await;
-    //         if self.inode != other.inode
-    //             || self.id != other.id
-    //             || self.mode != other.mode
-    //             || self.refcount.load(Ordering::Acquire) != other.refcount.load(Ordering::Acquire)
-    //         {
-    //             return false;
-    //         }
-
-    //         match (&self.handle, &other.handle) {
-    //             (InodeHandle::File(f1), InodeHandle::File(f2)) => f1.as_raw_fd() == f2.as_raw_fd(),
-    //             (InodeHandle::Handle(h1), InodeHandle::Handle(h2)) => {
-    //                 h1.file_handle() == h2.file_handle()
-    //             }
-    //             _ => false,
-    //         }
-    //     }
-    // }
-
-    fn stat_fd(fd: &impl AsRawFd) -> std::io::Result<libc::stat64> {
-        let mut st = MaybeUninit::<libc::stat64>::zeroed();
-        let null_path = c"";
-
-        // Safe because the kernel will only write data in `st` and we check the return value.
-        let res = unsafe {
-            libc::fstatat64(
-                fd.as_raw_fd(),
-                null_path.as_ptr(),
-                st.as_mut_ptr(),
-                libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if res >= 0 {
-            // Safe because the kernel guarantees that the struct is now fully initialized.
-            Ok(unsafe { st.assume_init() })
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    }
 
     #[test]
     fn test_inode_store() {
@@ -206,16 +162,8 @@ mod test {
 
         let inode1: Inode = 3;
         let inode2: Inode = 4;
-        let inode_stat1 = StatExt {
-            st: stat_fd(tmpfile1.as_file()).unwrap(),
-            mnt_id: 0,
-            btime: None,
-        };
-        let inode_stat2 = StatExt {
-            st: stat_fd(tmpfile2.as_file()).unwrap(),
-            mnt_id: 0,
-            btime: None,
-        };
+        let inode_stat1 = statx::statx(tmpfile1.as_file(), None).unwrap();
+        let inode_stat2 = statx::statx(tmpfile2.as_file(), None).unwrap();
         let id1 = InodeId::from_stat(&inode_stat1);
         let id2 = InodeId::from_stat(&inode_stat2);
         let file_or_handle1 = InodeHandle::File(tmpfile1.into_file());
