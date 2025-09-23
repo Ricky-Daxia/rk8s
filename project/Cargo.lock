@@ -3404,31 +3404,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libfuse-fs"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a7a2c361e20ba70c2981998334059ec31e0d8459def244eae3f17dc4533b7f7"
-dependencies = [
- "bitflags 2.9.4",
- "bytes",
- "clap",
- "env_logger 0.11.8",
- "futures",
- "futures-util",
- "libc",
- "log",
- "radix_trie",
- "reqwest",
- "rfuse3 0.0.3 (registry+https://github.com/rust-lang/crates.io-index)",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
- "vm-memory",
- "vmm-sys-util",
-]
-
-[[package]]
 name = "libipam"
 version = "0.1.0"
 dependencies = [
@@ -5083,7 +5058,7 @@ dependencies = [
  "indicatif",
  "ipc-channel",
  "libc",
- "libfuse-fs 0.1.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libfuse-fs",
  "nix 0.29.0",
  "oci-distribution",
  "oci-spec",
