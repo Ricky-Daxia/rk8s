@@ -343,6 +343,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         if res == 0 {
             if let Some(st) = st
                 && let Some(btime) = st.btime
+                && (btime.tv_sec != 0 || btime.tv_nsec != 0)
             {
                 let key = FileUniqueKey(st.st.st_ino, btime);
                 self.handle_cache.invalidate(&key).await;
