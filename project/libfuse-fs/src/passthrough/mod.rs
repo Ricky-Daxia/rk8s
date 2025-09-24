@@ -258,11 +258,7 @@ impl InodeMap {
                     // inode ID.
                     // (This can happen when we look up a new file that has reused the inode ID
                     // of some previously unlinked inode we still have in `.inodes`.)
-                    let res = data.handle.file_handle().is_none();
-                    if !res {
-                        println!("?????");
-                    }
-                    res
+                    data.handle.file_handle().is_none()
                 })
             })
             .cloned()
@@ -548,7 +544,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 2,
                 id,
                 st.st.st_mode,
-                st.btime.unwrap(),
+                st.btime
+                    .ok_or_else(|| io::Error::other("birth time not available"))?,
             )))
             .await;
 
@@ -816,7 +813,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                             1,
                             id,
                             st.st.st_mode,
-                            st.btime.unwrap(),
+                            st.btime
+                                .ok_or_else(|| io::Error::other("birth time not available"))?,
                         )),
                     );
 
