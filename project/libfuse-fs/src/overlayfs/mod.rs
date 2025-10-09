@@ -2609,3 +2609,65 @@ pub async fn mount_fs(
             .expect("Privileged mount failed")
     }
 }
+
+/// For xfstests
+pub async fn mount_fs_for_test(
+    mountpoint: String,
+    upperdir: String,
+    lowerdir: Vec<String>,
+    privileged: bool,
+    name: String,
+) -> rfuse3::raw::MountHandle {
+    // Create lower layers
+    let mut lower_layers = Vec::new();
+    for lower in &lowerdir {
+        let layer = new_passthroughfs_layer(lower)
+            .await
+            .expect("Failed to create lower filesystem layer");
+        lower_layers.push(Arc::new(layer));
+    }
+    // Create upper layer
+    let upper_layer = Arc::new(
+        new_passthroughfs_layer(&upperdir)
+            .await
+            .expect("Failed to create upper filesystem layer"),
+    );
+
+    // Configure overlay filesystem
+    let config = Config {
+        mountpoint: mountpoint.clone(),
+        do_import: true,
+        ..Default::default()
+    };
+    let overlayfs = OverlayFs::new(Some(upper_layer), lower_layers, config, 1)
+        .expect("Failed to initialize OverlayFs");
+    let logfs = LoggingFileSystem::new(overlayfs);
+
+    let mount_path: OsString = OsString::from(mountpoint);
+
+    // Obtain the current user's uid and gid
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    let mut mount_options = MountOptions::default();
+    mount_options
+        .force_readdir_plus(true)
+        .uid(uid)
+        .gid(gid)
+        .fs_name(name);
+
+    // Mount filesystem based on privilege flag and return the mount handle
+    if !privileged {
+        debug!("Mounting with unprivileged mode");
+        Session::new(mount_options)
+            .mount_with_unprivileged(logfs, mount_path)
+            .await
+            .expect("Unprivileged mount failed")
+    } else {
+        debug!("Mounting with privileged mode");
+        Session::new(mount_options)
+            .mount(logfs, mount_path)
+            .await
+            .expect("Privileged mount failed")
+    }
+}
