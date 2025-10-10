@@ -11,5 +11,4 @@ libc = "0.2.171"
 log = "0.4.26"
 env_logger = "0.11.7"
 tokio = { version = "1.44.0", features = ["full"] }
-signal-hook = "0.3"
 rfuse3 = { version = "0.0.3", features = ["tokio-runtime", "unprivileged"] }
