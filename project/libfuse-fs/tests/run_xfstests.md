@@ -11,9 +11,8 @@ xfstests helps developers quickly identify regressions and bugs in filesystem im
 1. build test program and install it
 
 ```bash
-cd overlay
-cargo build --release
-sudo install -t /usr/sbin/ -m 700 ./target/release/overlay
+cargo build --example overlay --release
+sudo install -t /usr/sbin/ -m 700 ../../target/release/examples/overlay 
 ```
 
 2. execute test script

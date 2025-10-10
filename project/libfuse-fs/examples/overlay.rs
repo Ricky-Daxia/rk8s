@@ -1,3 +1,5 @@
+// for xfstests
+
 #[derive(Debug, Default)]
 struct Args {
     name: String,
@@ -89,16 +91,14 @@ fn parse_args() -> Result<Args, std::io::Error> {
 
 fn set_log(args: &Args) {
     let log_level = match args.log_level.as_str() {
-        "error" => log::LevelFilter::Error,
-        "warn" => log::LevelFilter::Warn,
-        "info" => log::LevelFilter::Info,
-        "debug" => log::LevelFilter::Debug,
-        "trace" => log::LevelFilter::Trace,
-        _ => log::LevelFilter::Info,
+        "error" => tracing::Level::ERROR,
+        "warn" => tracing::Level::WARN,
+        "info" => tracing::Level::INFO,
+        "debug" => tracing::Level::DEBUG,
+        "trace" => tracing::Level::TRACE,
+        _ => tracing::Level::INFO,
     };
-    env_logger::Builder::new()
-        .filter(None, log_level)
-        .init();
+    tracing_subscriber::fmt().with_max_level(log_level).init();
 }
 
 #[tokio::main]
@@ -119,11 +119,11 @@ async fn main() -> Result<(), std::io::Error> {
 
     let handle = &mut mount_handle;
 
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
-    
+
     tokio::select! {
         res = handle => res?,
         _ = sigint.recv() => mount_handle.unmount().await?,
