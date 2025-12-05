@@ -73,10 +73,12 @@ pub(crate) struct OverlayInode {
     pub real_inodes: Mutex<Vec<Arc<RealInode>>>,
     // Inode number.
     pub inode: u64,
-    // Path and name of this overlay entry. Each hard link is represented by its own
-    // OverlayInode, so these fields always describe that specific path, even if multiple
-    // OverlayInodes reference the same host inode via RealInode. Use path_mapping in
-    // InodeStore for accurate path-to-inode lookups across all paths.
+    // Path and name of this inode.
+    // WARNING: For files with multiple hard links, these fields may not accurately
+    // reflect all paths pointing to this inode, since hard links share the same
+    // OverlayInode object. After a rename operation on one hard link, these fields
+    // will be updated but other hard links will still point to the same object.
+    // Use path_mapping in InodeStore for accurate path-to-inode lookups.
     pub path: RwLock<String>,
     pub name: RwLock<String>,
     pub lookups: AtomicU64,
@@ -108,7 +110,14 @@ pub struct OverlayFs {
     killpriv_v2: AtomicBool,
     perfile_dax: AtomicBool,
     root_inodes: u64,
+    // Weak reference to self, for dropping `HandleData`.
+    fs: Weak<OverlayFs>,
+    rename_lock: Mutex<()>,
 }
+
+/// A newtype wrapper around `Arc<OverlayFs>` to satisfy the orphan rule,
+/// allowing us to implement the external `Filesystem` trait.
+pub struct ArcOverlayFs(pub Arc<OverlayFs>);
 
 // This is a wrapper of one inode in specific layer, It can't impl Clone trait.
 struct RealHandle {
@@ -122,6 +131,24 @@ struct HandleData {
     node: Arc<OverlayInode>,
     //offset: libc::off_t,
     real_handle: Option<RealHandle>,
+    // Cache the directory entries for stable readdir offsets.
+    // The snapshot contains all necessary info to avoid re-accessing childrens map.
+    dir_snapshot: Mutex<Option<Vec<DirectoryEntryPlus>>>,
+    fs: Weak<OverlayFs>,
+}
+
+impl Drop for HandleData {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.dir_snapshot.get_mut().take()
+            && let Some(fs) = self.fs.upgrade()
+        {
+            tokio::spawn(async move {
+                for entry in snapshot.iter().skip(2) {
+                    fs.forget_one(entry.inode, 1).await;
+                }
+            });
+        }
+    }
 }
 
 // RealInode is a wrapper of one inode in specific layer.
@@ -172,7 +199,10 @@ impl RealInode {
             Ok(v1) => Ok(Some(v1)),
             Err(e) => match e.raw_os_error() {
                 Some(raw_error) => {
-                    if raw_error == libc::ENOENT || raw_error == libc::ENAMETOOLONG {
+                    if raw_error == libc::ENOENT
+                        || raw_error == libc::ENAMETOOLONG
+                        || raw_error == libc::ESTALE
+                    {
                         return Ok(None);
                     }
                     Err(e)
@@ -977,13 +1007,12 @@ fn entry_type_from_mode(mode: libc::mode_t) -> u8 {
     }
 }
 impl OverlayFs {
-    pub fn new(
+    fn new_inner(
         upper: Option<Arc<BoxedLayer>>,
         lowers: Vec<Arc<BoxedLayer>>,
         params: Config,
         root_inode: u64,
     ) -> Result<Self> {
-        // load root inode
         Ok(OverlayFs {
             config: params,
             lower_layers: lowers,
@@ -997,7 +1026,31 @@ impl OverlayFs {
             killpriv_v2: AtomicBool::new(false),
             perfile_dax: AtomicBool::new(false),
             root_inodes: root_inode,
+            fs: Weak::new(),
+            rename_lock: Mutex::new(()),
         })
+    }
+
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(
+        upper: Option<Arc<BoxedLayer>>,
+        lowers: Vec<Arc<BoxedLayer>>,
+        params: Config,
+        root_inode: u64,
+    ) -> Result<ArcOverlayFs> {
+        // let fs = OverlayFs::new_inner(upper, lowers, params, root_inode)?;
+        // let arc_fs = Arc::new(fs);
+        // let weak_fs = Arc::downgrade(&arc_fs);
+        // let fs_mut = unsafe { &mut *(Arc::as_ptr(&arc_fs) as *mut OverlayFs) };
+        // fs_mut.fs = weak_fs;
+        // Ok(ArcOverlayFs(arc_fs))
+        let mut fs_template = OverlayFs::new_inner(upper, lowers, params, root_inode)?;
+        let arc_fs = Arc::new_cyclic(|weak_self| {
+            // Move the pre-created template in and finish initialization.
+            fs_template.fs = weak_self.clone();
+            fs_template
+        });
+        Ok(ArcOverlayFs(arc_fs))
     }
 
     pub fn root_inode(&self) -> Inode {
@@ -1091,6 +1144,27 @@ impl OverlayFs {
         }
     }
 
+    async fn lookup_child_from_layers(
+        &self,
+        ctx: Request,
+        parent: &Arc<OverlayInode>,
+        name: &str,
+    ) -> Result<Option<RealInode>> {
+        let backing = {
+            let guard = parent.real_inodes.lock().await;
+            guard.iter().cloned().collect::<Vec<_>>()
+        };
+        for real in backing {
+            if real.whiteout {
+                break;
+            }
+            if let Some(child) = real.lookup_child(ctx, name).await? {
+                return Ok(Some(child));
+            }
+        }
+        Ok(None)
+    }
+
     // Return the inode only if it's permanently deleted from both self.inodes and self.deleted_inodes.
     async fn remove_inode(
         &self,
@@ -1165,8 +1239,26 @@ impl OverlayFs {
             // Child is found.
             Some(v) => Ok(v),
             None => {
-                trace!("lookup_node: child {name} not found");
-                Err(Error::from_raw_os_error(libc::ENOENT))
+                trace!("lookup_node: child {name} not found in cache, attempting fallback lookup");
+                match self.lookup_child_from_layers(ctx, &pnode, name).await? {
+                    Some(real_child) => {
+                        let mut base = pnode.path.read().await.clone();
+                        if base.is_empty() || !base.ends_with('/') {
+                            base.push('/');
+                        }
+                        let child_path = format!("{base}{name}");
+                        let child_ino = self.alloc_inode(&child_path).await?;
+                        let overlay_child = OverlayInode::new_from_real_inode(
+                            name, child_ino, child_path, real_child,
+                        )
+                        .await;
+                        let child_arc = Arc::new(overlay_child);
+                        pnode.insert_child(name, child_arc.clone()).await;
+                        self.insert_inode(child_arc.inode, child_arc.clone()).await;
+                        Ok(child_arc)
+                    }
+                    None => Err(Error::from_raw_os_error(libc::ENOENT)),
+                }
             }
         }
     }
@@ -1236,6 +1328,7 @@ impl OverlayFs {
     }
 
     async fn forget_one(&self, inode: Inode, count: u64) {
+        let _rename_guard = self.rename_lock.lock().await;
         if inode == self.root_inode() || inode == 0 {
             return;
         }
@@ -1332,59 +1425,28 @@ impl OverlayFs {
     ) -> Result<
         impl futures_util::stream::Stream<Item = std::result::Result<DirectoryEntry, Errno>> + Send + 'a,
     > {
-        // lookup the directory
-        let ovl_inode = match self.handles.lock().await.get(&handle) {
-            Some(dir) => dir.node.clone(),
-            None => {
-                // Try to get data with inode.
-                let node = self.lookup_node(ctx, inode, ".").await?;
+        let snapshot = self.get_or_create_dir_snapshot(ctx, inode, handle).await?;
 
-                let st = node.stat64(ctx).await?;
-                if !utils::is_dir(&st.attr.kind) {
-                    return Err(Error::from_raw_os_error(libc::ENOTDIR));
-                }
-
-                node.clone()
-            }
-        };
-        self.load_directory(ctx, &ovl_inode).await?;
-        let mut childrens = Vec::new();
-        //add myself as "."
-        childrens.push((".".to_string(), ovl_inode.clone()));
-
-        //add parent
-        let parent_node = match ovl_inode.parent.lock().await.upgrade() {
-            Some(p) => p.clone(),
-            None => self.root_node().await,
-        };
-        childrens.push(("..".to_string(), parent_node));
-
-        for (name, child) in ovl_inode.childrens.lock().await.iter() {
-            // skip whiteout node
-            if child.whiteout.load(Ordering::Relaxed) {
-                continue;
-            }
-            childrens.push((name.clone(), child.clone()));
-        }
-
-        if offset >= childrens.len() as u64 {
-            return Ok(iter(vec![].into_iter()));
-        }
-        let mut d: Vec<std::result::Result<DirectoryEntry, Errno>> = Vec::new();
-
-        for (index, (name, child)) in (0_u64..).zip(childrens.into_iter()) {
-            // make struct DireEntry and Entry
-            let st = child.stat64(ctx).await?;
-            let dir_entry = DirectoryEntry {
-                inode: child.inode,
-                kind: st.attr.kind,
-                name: name.into(),
-                offset: (index + 1) as i64,
+        let entries: Vec<std::result::Result<DirectoryEntry, Errno>> =
+            if offset < snapshot.len() as u64 {
+                snapshot
+                    .iter()
+                    .enumerate()
+                    .skip(offset as usize)
+                    .map(|(index, entry_plus)| {
+                        Ok(DirectoryEntry {
+                            inode: entry_plus.inode,
+                            kind: entry_plus.kind,
+                            name: entry_plus.name.clone(),
+                            offset: (index + 1) as i64,
+                        })
+                    })
+                    .collect()
+            } else {
+                vec![]
             };
-            d.push(Ok(dir_entry));
-        }
 
-        Ok(iter(d.into_iter()))
+        Ok(iter(entries))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1399,75 +1461,128 @@ impl OverlayFs {
         + Send
         + 'a,
     > {
-        // lookup the directory
-        let ovl_inode = match self.handles.lock().await.get(&handle) {
-            Some(dir) => {
-                trace!(
-                    "do_readdirplus: handle {} found, inode {}",
-                    handle, dir.node.inode
-                );
-                dir.node.clone()
-            }
-            None => {
-                trace!("do_readdirplus: handle {handle} not found, lookup inode {inode}");
-                // Try to get data with inode.
-                let node = self.lookup_node(ctx, inode, ".").await?;
+        let snapshot = self.get_or_create_dir_snapshot(ctx, inode, handle).await?;
 
+        let entries: Vec<std::result::Result<DirectoryEntryPlus, Errno>> =
+            if offset < snapshot.len() as u64 {
+                snapshot
+                    .iter()
+                    .skip(offset as usize)
+                    .map(|entry| Ok(entry.clone()))
+                    .collect()
+            } else {
+                vec![]
+            };
+
+        Ok(iter(entries))
+    }
+
+    async fn get_or_create_dir_snapshot(
+        &self,
+        ctx: Request,
+        inode: Inode,
+        handle: u64,
+    ) -> Result<Vec<DirectoryEntryPlus>> {
+        let handle_data = match self.handles.lock().await.get(&handle) {
+            Some(hd) if hd.node.inode == inode => hd.clone(),
+            _ => {
+                // Fallback for cases without a valid handle (e.g. no-opendir)
+                trace!(
+                    "get_or_create_dir_snapshot: handle {handle} not found or inode mismatch, falling back to inode {inode} lookup"
+                );
+                let node = self.lookup_node(ctx, inode, ".").await?;
                 let st = node.stat64(ctx).await?;
                 if !utils::is_dir(&st.attr.kind) {
                     return Err(Error::from_raw_os_error(libc::ENOTDIR));
                 }
-
-                node.clone()
+                // Create a temporary HandleData for this call only.
+                Arc::new(HandleData {
+                    node,
+                    real_handle: None,
+                    dir_snapshot: Mutex::new(None),
+                    fs: self.fs.clone(),
+                })
             }
         };
-        self.load_directory(ctx, &ovl_inode).await?;
 
-        let mut childrens = Vec::new();
-        //add myself as "."
-        childrens.push((".".to_string(), ovl_inode.clone()));
+        // Optimistic check
+        if let Some(snapshot) = handle_data.dir_snapshot.lock().await.as_ref() {
+            return Ok(snapshot.clone());
+        }
 
-        //add parent
+        // Snapshot doesn't exist, create it.
+        let ovl_inode = &handle_data.node;
+        self.load_directory(ctx, ovl_inode).await?;
+
+        let mut entries = Vec::new();
+
+        // 1. Add "." entry
+        let mut st_self = ovl_inode.stat64(ctx).await?;
+        st_self.attr.ino = ovl_inode.inode;
+        entries.push(DirectoryEntryPlus {
+            inode: ovl_inode.inode,
+            generation: 0,
+            kind: st_self.attr.kind,
+            name: ".".into(),
+            offset: 1,
+            attr: st_self.attr,
+            entry_ttl: st_self.ttl,
+            attr_ttl: st_self.ttl,
+        });
+
+        // 2. Add ".." entry
         let parent_node = match ovl_inode.parent.lock().await.upgrade() {
-            Some(p) => p.clone(),
+            Some(node) => node,
             None => self.root_node().await,
         };
-        childrens.push(("..".to_string(), parent_node));
+        let mut st_parent = parent_node.stat64(ctx).await?;
+        st_parent.attr.ino = parent_node.inode;
+        entries.push(DirectoryEntryPlus {
+            inode: parent_node.inode,
+            generation: 0,
+            kind: st_parent.attr.kind,
+            name: "..".into(),
+            offset: 2,
+            attr: st_parent.attr,
+            entry_ttl: st_parent.ttl,
+            attr_ttl: st_parent.ttl,
+        });
 
-        for (name, child) in ovl_inode.childrens.lock().await.iter() {
-            // skip whiteout node
+        // 3. Add children entries
+        let children = ovl_inode.childrens.lock().await;
+        for (name, child) in children.iter() {
             if child.whiteout.load(Ordering::Relaxed) {
                 continue;
             }
-            childrens.push((name.clone(), child.clone()));
+            let mut st_child = child.stat64(ctx).await?;
+            st_child.attr.ino = child.inode;
+            child.lookups.fetch_add(1, Ordering::Relaxed);
+            entries.push(DirectoryEntryPlus {
+                inode: child.inode,
+                generation: 0,
+                kind: st_child.attr.kind,
+                name: name.clone().into(),
+                offset: (entries.len() + 1) as i64,
+                attr: st_child.attr,
+                entry_ttl: st_child.ttl,
+                attr_ttl: st_child.ttl,
+            });
         }
 
-        if offset >= childrens.len() as u64 {
-            return Ok(iter(vec![].into_iter()));
-        }
-        let mut d: Vec<std::result::Result<DirectoryEntryPlus, Errno>> = Vec::new();
-
-        for (index, (name, child)) in (0_u64..).zip(childrens.into_iter()) {
-            if index >= offset {
-                // make struct DireEntry and Entry
-                let mut st = child.stat64(ctx).await?;
-                child.lookups.fetch_add(1, Ordering::Relaxed);
-                st.attr.ino = child.inode;
-                let dir_entry = DirectoryEntryPlus {
-                    inode: child.inode,
-                    generation: 0,
-                    kind: st.attr.kind,
-                    name: name.into(),
-                    offset: (index + 1) as i64,
-                    attr: st.attr,
-                    entry_ttl: st.ttl,
-                    attr_ttl: st.ttl,
-                };
-                d.push(Ok(dir_entry));
+        let mut snapshot_guard = handle_data.dir_snapshot.lock().await;
+        if snapshot_guard.is_none() {
+            // We won the race, install our prepared snapshot.
+            *snapshot_guard = Some(entries.clone());
+            Ok(entries)
+        } else {
+            // Another thread won the race while we were preparing.
+            // Discard our work and use the existing snapshot.
+            for entry in entries.iter().skip(2) {
+                // skip "." and ".."
+                self.forget_one(entry.inode, 1).await;
             }
+            Ok(snapshot_guard.as_ref().unwrap().clone())
         }
-
-        Ok(iter(d.into_iter()))
     }
 
     async fn do_mkdir(
@@ -1784,6 +1899,8 @@ impl OverlayFs {
                             inode: real_ino.lock().await.unwrap(),
                             handle: AtomicU64::new(hd),
                         }),
+                        dir_snapshot: Mutex::new(None),
+                        fs: self.fs.clone(),
                     };
                     self.handles
                         .lock()
@@ -1797,7 +1914,6 @@ impl OverlayFs {
         Ok(final_handle)
     }
 
-    /// Shared implementation for rename/rename2 handling all flag combinations.
     async fn do_rename(
         &self,
         req: Request,
@@ -1864,10 +1980,17 @@ impl OverlayFs {
             }
 
             // Perform atomic exchange
-            match p_layer
+            #[cfg(test)]
+            let rename_res: rfuse3::Result<()> = p_layer
                 .rename2(req, p_inode, name, new_p_inode, new_name, flags)
-                .await
-            {
+                .await;
+
+            #[cfg(not(test))]
+            let rename_res: rfuse3::Result<()> = p_layer
+                .rename2(req, p_inode, name, new_p_inode, new_name, flags)
+                .await;
+
+            match rename_res {
                 Ok(_) => {
                     // Sync overlay metadata
                     self.atomic_exchange_metadata(
@@ -1958,9 +2081,15 @@ impl OverlayFs {
                 Err(e) => {
                     let io_err: std::io::Error = e.into();
                     if io_err.raw_os_error() == Some(libc::ENOSYS) {
-                        return Err(Error::from_raw_os_error(libc::ENOSYS));
+                        if flags != 0 {
+                            return Err(Error::from_raw_os_error(libc::EINVAL));
+                        }
+                        p_layer
+                            .rename(req, p_inode, name, new_p_inode, new_name)
+                            .await?;
+                    } else {
+                        return Err(io_err);
                     }
-                    return Err(io_err);
                 }
             }
         } else {
@@ -1979,13 +2108,13 @@ impl OverlayFs {
 
         // Update src location (RENAME_WHITEOUT creates marker)
         if has_whiteout {
-            // Remove src and create whiteout
+            // Remove src and track kernel-created whiteout
             pnode.remove_child(name_str).await;
             let old_src_path = s_node.path.read().await.clone();
             let _ = self.remove_inode(s_node.inode, Some(old_src_path)).await;
 
-            // Create whiteout
-            let white_entry = p_layer.create_whiteout(req, p_inode, name).await?;
+            // Lookup the whiteout inserted by renameat2(RENAME_WHITEOUT)
+            let white_entry = p_layer.lookup(req, p_inode, name).await?;
 
             let white_path = format!("{}/{}", pnode.path.read().await, name_str);
             let white_ino = {
@@ -1997,7 +2126,9 @@ impl OverlayFs {
                 layer: p_layer.clone(),
                 in_upper_layer: true,
                 inode: white_entry.attr.ino,
-                whiteout: true,
+                // The kernel already created an actual character-device whiteout for the user,
+                // so keep it visible (do not mark as internal tombstone).
+                whiteout: false,
                 opaque: false,
                 stat: Some(ReplyAttr {
                     ttl: white_entry.ttl,
@@ -2608,6 +2739,7 @@ impl OverlayFs {
     }
 
     async fn do_rm(&self, ctx: Request, parent: u64, name: &OsStr, dir: bool) -> Result<()> {
+        let _rename_guard = self.rename_lock.lock().await;
         // 1. Read-only mount guard
         if self.upper_layer.is_none() {
             return Err(Error::from_raw_os_error(libc::EROFS));
@@ -2910,6 +3042,8 @@ impl OverlayFs {
                     inode,
                     handle: AtomicU64::new(0),
                 }),
+                dir_snapshot: Mutex::new(None),
+                fs: self.fs.clone(),
             };
             return Ok(Arc::new(handle_data));
         }

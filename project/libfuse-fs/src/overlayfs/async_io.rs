@@ -1,6 +1,7 @@
 use super::Inode;
 use super::OverlayFs;
 use super::utils;
+use crate::overlayfs::ArcOverlayFs;
 use crate::overlayfs::HandleData;
 use crate::overlayfs::RealHandle;
 use crate::overlayfs::{AtomicU64, CachePolicy};
@@ -13,6 +14,7 @@ use std::io::ErrorKind;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use tokio::sync::Mutex;
 use tracing::info;
 use tracing::trace;
 
@@ -278,6 +280,185 @@ impl Filesystem for OverlayFs {
         new_name: &OsStr,
         flags: u32,
     ) -> Result<()> {
+        tracing::debug!(
+            "rename2: parent={}, name={:?}, new_parent={}, new_name={:?}, flags={:#x}",
+            parent,
+            name,
+            new_parent,
+            new_name,
+            flags
+        );
+
+        // For RENAME_EXCHANGE: directly handle it here since do_rename has issues
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            tracing::warn!("RENAME_EXCHANGE: Handling directly in rename2");
+
+            let name_str = name
+                .to_str()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            let new_name_str = new_name
+                .to_str()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+
+            // Get parent nodes
+            let parent_node = self
+                .lookup_node(req, parent, "")
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            let new_parent_node = self
+                .lookup_node(req, new_parent, "")
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+
+            // Get source and dest nodes - both must exist for RENAME_EXCHANGE
+            let src_node = self
+                .lookup_node(req, parent, name_str)
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::ENOENT)))?;
+            let dest_node = self
+                .lookup_node(req, new_parent, new_name_str)
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::ENOENT)))?;
+
+            // Check for whiteouts
+            if src_node.whiteout.load(std::sync::atomic::Ordering::Relaxed)
+                || dest_node
+                    .whiteout
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(rfuse3::Errno::from(libc::ENOENT));
+            }
+
+            // Copy nodes up to upper layer
+            let pnode = self
+                .copy_node_up(req, parent_node)
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            let new_pnode = self
+                .copy_node_up(req, new_parent_node)
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            let s_node = self
+                .copy_node_up(req, src_node)
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            let d_node = self
+                .copy_node_up(req, dest_node)
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+
+            // Get layer and inodes
+            let (p_layer, _, p_inode) = pnode.first_layer_inode().await;
+            let (new_p_layer, _, new_p_inode) = new_pnode.first_layer_inode().await;
+
+            // Ensure same layer
+            if !std::sync::Arc::ptr_eq(&p_layer, &new_p_layer) {
+                return Err(rfuse3::Errno::from(libc::EXDEV));
+            }
+
+            // Call underlying layer's rename2
+            tracing::warn!("Calling p_layer.rename2 for RENAME_EXCHANGE");
+            let rename_result = p_layer
+                .rename2(req, p_inode, name, new_p_inode, new_name, flags)
+                .await;
+            tracing::warn!("p_layer.rename2 returned: {:?}", rename_result);
+
+            rename_result.map_err(|e| {
+                let errno: rfuse3::Errno = e;
+                tracing::error!("p_layer.rename2 failed: {:?}", errno);
+                errno
+            })?;
+
+            // Update overlay metadata - INLINED to avoid async function execution bug
+            tracing::warn!("INLINED: Updating metadata for atomic exchange");
+            let _ = std::fs::write(
+                "/tmp/atomic_exchange_inline",
+                format!("Inlined: {} <-> {}", name_str, new_name_str),
+            );
+
+            // Calculate new paths
+            let src_new_path = format!("{}/{}", new_pnode.path.read().await, new_name_str);
+            let dst_new_path = format!("{}/{}", pnode.path.read().await, name_str);
+            tracing::warn!(
+                "INLINED: src_new_path={}, dst_new_path={}",
+                src_new_path,
+                dst_new_path
+            );
+
+            // Update node metadata
+            *s_node.path.write().await = src_new_path.clone();
+            *s_node.name.write().await = new_name_str.to_string();
+            *s_node.parent.lock().await = std::sync::Arc::downgrade(&new_pnode);
+
+            *d_node.path.write().await = dst_new_path.clone();
+            *d_node.name.write().await = name_str.to_string();
+            *d_node.parent.lock().await = std::sync::Arc::downgrade(&pnode);
+            tracing::warn!("INLINED: Updated node paths and parents");
+
+            // CRITICAL: Update parent-child relationships FIRST to avoid race condition
+            // Race scenario: If we update inode_store first, other threads can lookup
+            // with new paths but find inconsistent parent.childrens
+            if std::sync::Arc::ptr_eq(&pnode, &new_pnode) {
+                tracing::warn!("INLINED: Same directory swap");
+                let mut children = pnode.childrens.lock().await;
+                children.insert(name_str.to_string(), d_node.clone());
+                children.insert(new_name_str.to_string(), s_node.clone());
+            } else {
+                tracing::warn!("INLINED: Different directories swap");
+                // Lock both parent directories in a consistent order to avoid deadlocks
+                let (first, second) = if pnode.inode < new_pnode.inode {
+                    (&pnode, &new_pnode)
+                } else {
+                    (&new_pnode, &pnode)
+                };
+
+                let mut first_children = first.childrens.lock().await;
+                let mut second_children = second.childrens.lock().await;
+
+                tracing::warn!(
+                    "INLINED: Before swap: first has {} children, second has {} children",
+                    first_children.len(),
+                    second_children.len()
+                );
+
+                // Now determine which is which and update accordingly
+                if std::sync::Arc::ptr_eq(first, &pnode) {
+                    tracing::warn!("INLINED: first is pnode, second is new_pnode");
+                    first_children.remove(name_str);
+                    first_children.insert(name_str.to_string(), d_node.clone());
+
+                    second_children.remove(new_name_str);
+                    second_children.insert(new_name_str.to_string(), s_node.clone());
+                } else {
+                    tracing::warn!("INLINED: first is new_pnode, second is pnode");
+                    first_children.remove(new_name_str);
+                    first_children.insert(new_name_str.to_string(), s_node.clone());
+
+                    second_children.remove(name_str);
+                    second_children.insert(name_str.to_string(), d_node.clone());
+                }
+
+                tracing::warn!(
+                    "INLINED: After swap: first has {} children, second has {} children",
+                    first_children.len(),
+                    second_children.len()
+                );
+            }
+
+            // Update inode store AFTER parent-child relationships are consistent
+            // This ensures lookups always see atomic state
+            {
+                let mut inode_store = self.inodes.write().await;
+                inode_store.insert_inode(s_node.inode, s_node.clone()).await;
+                inode_store.insert_inode(d_node.inode, d_node.clone()).await;
+                tracing::warn!("INLINED: Updated inode store");
+            }
+
+            tracing::warn!("INLINED: RENAME_EXCHANGE metadata update completed");
+            return Ok(());
+        }
+
+        // For other flags, call do_rename
         self.do_rename(req, parent, name, new_parent, new_name, flags)
             .await
             .map_err(|e| e.into())
@@ -377,6 +558,8 @@ impl Filesystem for OverlayFs {
                 inode,
                 handle: AtomicU64::new(h.fh),
             }),
+            dir_snapshot: Mutex::new(None),
+            fs: self.fs.clone(),
         };
 
         self.handles.lock().await.insert(hd, Arc::new(handle_data));
@@ -692,6 +875,8 @@ impl Filesystem for OverlayFs {
                     inode: real_inode,
                     handle: AtomicU64::new(reply.fh),
                 }),
+                dir_snapshot: Mutex::new(None),
+                fs: self.fs.clone(),
             }),
         );
 
@@ -1020,37 +1205,84 @@ impl Filesystem for OverlayFs {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn copy_file_range(
-        &self,
-        req: Request,
-        _inode_in: Inode,
-        fh_in: u64,
-        offset_in: u64,
-        _inode_out: Inode,
-        fh_out: u64,
-        offset_out: u64,
-        length: u64,
-        flags: u64,
-    ) -> Result<ReplyCopyFileRange> {
-        let (src_layer, src_inode, src_handle) = self.find_real_info_from_handle(fh_in).await?;
-        let (dst_layer, dst_inode, dst_handle) = self.find_real_info_from_handle(fh_out).await?;
-
-        if !Arc::ptr_eq(&src_layer, &dst_layer) {
-            return Err(Error::from_raw_os_error(libc::EXDEV).into());
-        }
-
-        src_layer
-            .copy_file_range(
-                req, src_inode, src_handle, offset_in, dst_inode, dst_handle, offset_out, length,
-                flags,
-            )
-            .await
-    }
-
     async fn interrupt(&self, _req: Request, _unique: u64) -> Result<()> {
         Ok(())
     }
+}
+
+macro_rules! forward_filesystem_impl {
+    // Match async methods with a return value.
+    (
+        $(#[$meta:meta])*
+        async fn $name:ident ( &self, $( $arg:ident : $arg_ty:ty ),* ) -> $ret:ty
+    ) => {
+        $(#[$meta])*
+        async fn $name(&self, $( $arg: $arg_ty ),*) -> $ret {
+            (self.0).$name($( $arg ),*).await
+        }
+    };
+    // Match async methods with no return value (implicitly returns ()).
+    (
+        $(#[$meta:meta])*
+        async fn $name:ident ( &self, $( $arg:ident : $arg_ty:ty ),* )
+    ) => {
+        $(#[$meta])*
+        async fn $name(&self, $( $arg: $arg_ty ),*) {
+            (self.0).$name($( $arg ),*).await
+        }
+    };
+    // Match methods with lifetimes, like readdir and readdirplus.
+    (
+        $(#[$meta:meta])*
+        async fn $name:ident <'a> ( &'a self, $( $arg:ident : $arg_ty:ty ),* ) -> $ret:ty
+    ) => {
+        $(#[$meta])*
+        async fn $name<'a>(&'a self, $( $arg: $arg_ty ),*) -> $ret {
+            (self.0).$name($( $arg ),*).await
+        }
+    };
+}
+
+// Add this new implementation block, now using the macro.
+impl Filesystem for ArcOverlayFs {
+    forward_filesystem_impl!(async fn init(&self, req: Request) -> Result<ReplyInit>);
+    forward_filesystem_impl!(async fn destroy(&self, req: Request));
+    forward_filesystem_impl!(async fn lookup(&self, req: Request, parent: Inode, name: &OsStr) -> Result<ReplyEntry>);
+    forward_filesystem_impl!(async fn forget(&self, req: Request, inode: Inode, nlookup: u64));
+    forward_filesystem_impl!(async fn getattr(&self, req: Request, inode: Inode, fh: Option<u64>, flags: u32) -> Result<ReplyAttr>);
+    forward_filesystem_impl!(async fn setattr(&self, req: Request, inode: Inode, fh: Option<u64>, set_attr: SetAttr) -> Result<ReplyAttr>);
+    forward_filesystem_impl!(async fn readlink(&self, req: Request, inode: Inode) -> Result<ReplyData>);
+    forward_filesystem_impl!(async fn mknod(&self, req: Request, parent: Inode, name: &OsStr, mode: u32, rdev: u32) -> Result<ReplyEntry>);
+    forward_filesystem_impl!(async fn mkdir(&self, req: Request, parent: Inode, name: &OsStr, mode: u32, umask: u32) -> Result<ReplyEntry>);
+    forward_filesystem_impl!(async fn unlink(&self, req: Request, parent: Inode, name: &OsStr) -> Result<()>);
+    forward_filesystem_impl!(async fn rmdir(&self, req: Request, parent: Inode, name: &OsStr) -> Result<()>);
+    forward_filesystem_impl!(async fn symlink(&self, req: Request, parent: Inode, name: &OsStr, link: &OsStr) -> Result<ReplyEntry>);
+    forward_filesystem_impl!(async fn rename(&self, req: Request, parent: Inode, name: &OsStr, new_parent: Inode, new_name: &OsStr) -> Result<()>);
+    forward_filesystem_impl!(async fn rename2(&self, req: Request, parent: Inode, name: &OsStr, new_parent: Inode, new_name: &OsStr, flags: u32) -> Result<()>);
+    forward_filesystem_impl!(async fn link(&self, req: Request, inode: Inode, new_parent: Inode, new_name: &OsStr) -> Result<ReplyEntry>);
+    forward_filesystem_impl!(async fn open(&self, req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen>);
+    forward_filesystem_impl!(async fn read(&self, req: Request, inode: Inode, fh: u64, offset: u64, size: u32) -> Result<ReplyData>);
+    forward_filesystem_impl!(#[allow(clippy::too_many_arguments)] async fn write(&self, req: Request, inode: Inode, fh: u64, offset: u64, data: &[u8], write_flags: u32, flags: u32) -> Result<ReplyWrite>);
+    forward_filesystem_impl!(async fn flush(&self, req: Request, inode: Inode, fh: u64, lock_owner: u64) -> Result<()>);
+    forward_filesystem_impl!(async fn release(&self, req: Request, _inode: Inode, fh: u64, flags: u32, lock_owner: u64, flush: bool) -> Result<()>);
+    forward_filesystem_impl!(async fn fsync(&self, req: Request, inode: Inode, fh: u64, datasync: bool) -> Result<()>);
+    forward_filesystem_impl!(async fn opendir(&self, req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen>);
+    forward_filesystem_impl!(async fn readdir<'a>(&'a self, req: Request, parent: Inode, fh: u64, offset: i64) -> Result<ReplyDirectory<impl futures_util::stream::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>);
+    forward_filesystem_impl!(async fn readdirplus<'a>(&'a self, req: Request, parent: Inode, fh: u64, offset: u64, _lock_owner: u64) -> Result<ReplyDirectoryPlus<impl futures_util::stream::Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a>>);
+    forward_filesystem_impl!(async fn releasedir(&self, req: Request, _inode: Inode, fh: u64, flags: u32) -> Result<()>);
+    forward_filesystem_impl!(async fn fsyncdir(&self, req: Request, inode: Inode, fh: u64, datasync: bool) -> Result<()>);
+    forward_filesystem_impl!(async fn statfs(&self, req: Request, inode: Inode) -> Result<ReplyStatFs>);
+    forward_filesystem_impl!(async fn setxattr(&self, req: Request, inode: Inode, name: &OsStr, value: &[u8], flags: u32, position: u32) -> Result<()>);
+    forward_filesystem_impl!(async fn getxattr(&self, req: Request, inode: Inode, name: &OsStr, size: u32) -> Result<ReplyXAttr>);
+    forward_filesystem_impl!(async fn listxattr(&self, req: Request, inode: Inode, size: u32) -> Result<ReplyXAttr>);
+    forward_filesystem_impl!(async fn removexattr(&self, req: Request, inode: Inode, name: &OsStr) -> Result<()>);
+    forward_filesystem_impl!(async fn access(&self, req: Request, inode: Inode, mask: u32) -> Result<()>);
+    forward_filesystem_impl!(async fn create(&self, req: Request, parent: Inode, name: &OsStr, mode: u32, flags: u32) -> Result<ReplyCreated>);
+    forward_filesystem_impl!(async fn batch_forget(&self, _req: Request, inodes: &[(Inode, u64)]));
+    forward_filesystem_impl!(#[allow(clippy::too_many_arguments)] async fn fallocate(&self, req: Request, inode: Inode, fh: u64, offset: u64, length: u64, mode: u32) -> Result<()>);
+    forward_filesystem_impl!(async fn lseek(&self, req: Request, inode: Inode, fh: u64, offset: u64, whence: u32) -> Result<ReplyLSeek>);
+    forward_filesystem_impl!(async fn interrupt(&self, _req: Request, _unique: u64) -> Result<()>);
+    forward_filesystem_impl!(#[allow(clippy::too_many_arguments)] async fn copy_file_range(&self, req: Request, inode_in: Inode, fh_in: u64, offset_in: u64, inode_out: Inode, fh_out: u64, offset_out: u64, length: u64, flags: u64) -> Result<ReplyCopyFileRange>);
 }
 
 #[cfg(test)]
