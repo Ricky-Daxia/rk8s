@@ -1482,10 +1482,6 @@ impl OverlayFs {
         } else {
             // Another thread won the race while we were preparing.
             // Discard our work and use the existing snapshot.
-            for entry in entries.iter().skip(2) {
-                // skip "." and ".."
-                self.forget_one(entry.inode, 1).await;
-            }
             Ok(snapshot_guard.as_ref().unwrap().clone())
         }
     }
