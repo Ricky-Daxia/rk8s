@@ -1,6 +1,7 @@
 use super::Inode;
 use super::OverlayFs;
 use super::utils;
+use crate::overlayfs::ArcOverlayFs;
 use crate::overlayfs::HandleData;
 use crate::overlayfs::RealHandle;
 use crate::overlayfs::{AtomicU64, CachePolicy};
@@ -13,6 +14,7 @@ use std::io::ErrorKind;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use tokio::sync::Mutex;
 use tracing::info;
 use tracing::trace;
 
@@ -362,6 +364,8 @@ impl Filesystem for OverlayFs {
                 inode,
                 handle: AtomicU64::new(h.fh),
             }),
+            dir_snapshot: Mutex::new(None),
+            fs: self.fs.clone(),
         };
 
         self.handles.lock().await.insert(hd, Arc::new(handle_data));
@@ -730,6 +734,8 @@ impl Filesystem for OverlayFs {
                     inode: real_inode,
                     handle: AtomicU64::new(reply.fh),
                 }),
+                dir_snapshot: Mutex::new(None),
+                fs: self.fs.clone(),
             }),
         );
 
@@ -1061,6 +1067,81 @@ impl Filesystem for OverlayFs {
     async fn interrupt(&self, _req: Request, _unique: u64) -> Result<()> {
         Ok(())
     }
+}
+
+macro_rules! forward_filesystem_impl {
+    // Match async methods with a return value.
+    (
+        $(#[$meta:meta])*
+        async fn $name:ident ( &self, $( $arg:ident : $arg_ty:ty ),* ) -> $ret:ty
+    ) => {
+        $(#[$meta])*
+        async fn $name(&self, $( $arg: $arg_ty ),*) -> $ret {
+            (self.0).$name($( $arg ),*).await
+        }
+    };
+    // Match async methods with no return value (implicitly returns ()).
+    (
+        $(#[$meta:meta])*
+        async fn $name:ident ( &self, $( $arg:ident : $arg_ty:ty ),* )
+    ) => {
+        $(#[$meta])*
+        async fn $name(&self, $( $arg: $arg_ty ),*) {
+            (self.0).$name($( $arg ),*).await
+        }
+    };
+    // Match methods with lifetimes, like readdir and readdirplus.
+    (
+        $(#[$meta:meta])*
+        async fn $name:ident <'a> ( &'a self, $( $arg:ident : $arg_ty:ty ),* ) -> $ret:ty
+    ) => {
+        $(#[$meta])*
+        async fn $name<'a>(&'a self, $( $arg: $arg_ty ),*) -> $ret {
+            (self.0).$name($( $arg ),*).await
+        }
+    };
+}
+
+// Add this new implementation block, now using the macro.
+impl Filesystem for ArcOverlayFs {
+    forward_filesystem_impl!(async fn init(&self, req: Request) -> Result<ReplyInit>);
+    forward_filesystem_impl!(async fn destroy(&self, req: Request));
+    forward_filesystem_impl!(async fn lookup(&self, req: Request, parent: Inode, name: &OsStr) -> Result<ReplyEntry>);
+    forward_filesystem_impl!(async fn forget(&self, req: Request, inode: Inode, nlookup: u64));
+    forward_filesystem_impl!(async fn getattr(&self, req: Request, inode: Inode, fh: Option<u64>, flags: u32) -> Result<ReplyAttr>);
+    forward_filesystem_impl!(async fn setattr(&self, req: Request, inode: Inode, fh: Option<u64>, set_attr: SetAttr) -> Result<ReplyAttr>);
+    forward_filesystem_impl!(async fn readlink(&self, req: Request, inode: Inode) -> Result<ReplyData>);
+    forward_filesystem_impl!(async fn mknod(&self, req: Request, parent: Inode, name: &OsStr, mode: u32, rdev: u32) -> Result<ReplyEntry>);
+    forward_filesystem_impl!(async fn mkdir(&self, req: Request, parent: Inode, name: &OsStr, mode: u32, umask: u32) -> Result<ReplyEntry>);
+    forward_filesystem_impl!(async fn unlink(&self, req: Request, parent: Inode, name: &OsStr) -> Result<()>);
+    forward_filesystem_impl!(async fn rmdir(&self, req: Request, parent: Inode, name: &OsStr) -> Result<()>);
+    forward_filesystem_impl!(async fn symlink(&self, req: Request, parent: Inode, name: &OsStr, link: &OsStr) -> Result<ReplyEntry>);
+    forward_filesystem_impl!(async fn rename(&self, req: Request, parent: Inode, name: &OsStr, new_parent: Inode, new_name: &OsStr) -> Result<()>);
+    forward_filesystem_impl!(async fn rename2(&self, req: Request, parent: Inode, name: &OsStr, new_parent: Inode, new_name: &OsStr, flags: u32) -> Result<()>);
+    forward_filesystem_impl!(async fn link(&self, req: Request, inode: Inode, new_parent: Inode, new_name: &OsStr) -> Result<ReplyEntry>);
+    forward_filesystem_impl!(async fn open(&self, req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen>);
+    forward_filesystem_impl!(async fn read(&self, req: Request, inode: Inode, fh: u64, offset: u64, size: u32) -> Result<ReplyData>);
+    forward_filesystem_impl!(#[allow(clippy::too_many_arguments)] async fn write(&self, req: Request, inode: Inode, fh: u64, offset: u64, data: &[u8], write_flags: u32, flags: u32) -> Result<ReplyWrite>);
+    forward_filesystem_impl!(async fn flush(&self, req: Request, inode: Inode, fh: u64, lock_owner: u64) -> Result<()>);
+    forward_filesystem_impl!(async fn release(&self, req: Request, _inode: Inode, fh: u64, flags: u32, lock_owner: u64, flush: bool) -> Result<()>);
+    forward_filesystem_impl!(async fn fsync(&self, req: Request, inode: Inode, fh: u64, datasync: bool) -> Result<()>);
+    forward_filesystem_impl!(async fn opendir(&self, req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen>);
+    forward_filesystem_impl!(async fn readdir<'a>(&'a self, req: Request, parent: Inode, fh: u64, offset: i64) -> Result<ReplyDirectory<impl futures_util::stream::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>);
+    forward_filesystem_impl!(async fn readdirplus<'a>(&'a self, req: Request, parent: Inode, fh: u64, offset: u64, _lock_owner: u64) -> Result<ReplyDirectoryPlus<impl futures_util::stream::Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a>>);
+    forward_filesystem_impl!(async fn releasedir(&self, req: Request, _inode: Inode, fh: u64, flags: u32) -> Result<()>);
+    forward_filesystem_impl!(async fn fsyncdir(&self, req: Request, inode: Inode, fh: u64, datasync: bool) -> Result<()>);
+    forward_filesystem_impl!(async fn statfs(&self, req: Request, inode: Inode) -> Result<ReplyStatFs>);
+    forward_filesystem_impl!(async fn setxattr(&self, req: Request, inode: Inode, name: &OsStr, value: &[u8], flags: u32, position: u32) -> Result<()>);
+    forward_filesystem_impl!(async fn getxattr(&self, req: Request, inode: Inode, name: &OsStr, size: u32) -> Result<ReplyXAttr>);
+    forward_filesystem_impl!(async fn listxattr(&self, req: Request, inode: Inode, size: u32) -> Result<ReplyXAttr>);
+    forward_filesystem_impl!(async fn removexattr(&self, req: Request, inode: Inode, name: &OsStr) -> Result<()>);
+    forward_filesystem_impl!(async fn access(&self, req: Request, inode: Inode, mask: u32) -> Result<()>);
+    forward_filesystem_impl!(async fn create(&self, req: Request, parent: Inode, name: &OsStr, mode: u32, flags: u32) -> Result<ReplyCreated>);
+    forward_filesystem_impl!(async fn batch_forget(&self, _req: Request, inodes: &[(Inode, u64)]));
+    forward_filesystem_impl!(#[allow(clippy::too_many_arguments)] async fn fallocate(&self, req: Request, inode: Inode, fh: u64, offset: u64, length: u64, mode: u32) -> Result<()>);
+    forward_filesystem_impl!(async fn lseek(&self, req: Request, inode: Inode, fh: u64, offset: u64, whence: u32) -> Result<ReplyLSeek>);
+    forward_filesystem_impl!(async fn interrupt(&self, _req: Request, _unique: u64) -> Result<()>);
+    forward_filesystem_impl!(#[allow(clippy::too_many_arguments)] async fn copy_file_range(&self, req: Request, inode_in: Inode, fh_in: u64, offset_in: u64, inode_out: Inode, fh_out: u64, offset_out: u64, length: u64, flags: u64) -> Result<ReplyCopyFileRange>);
 }
 
 #[cfg(test)]
