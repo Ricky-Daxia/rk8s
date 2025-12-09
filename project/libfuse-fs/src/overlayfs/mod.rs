@@ -104,13 +104,7 @@ pub struct OverlayFs {
     killpriv_v2: AtomicBool,
     perfile_dax: AtomicBool,
     root_inodes: u64,
-    // Weak reference to self, for dropping `HandleData`.
-    fs: Weak<OverlayFs>,
 }
-
-/// A newtype wrapper around `Arc<OverlayFs>` to satisfy the orphan rule,
-/// allowing us to implement the external `Filesystem` trait.
-pub struct ArcOverlayFs(pub Arc<OverlayFs>);
 
 // This is a wrapper of one inode in specific layer, It can't impl Clone trait.
 struct RealHandle {
@@ -127,21 +121,6 @@ struct HandleData {
     // Cache the directory entries for stable readdir offsets.
     // The snapshot contains all necessary info to avoid re-accessing childrens map.
     dir_snapshot: Mutex<Option<Vec<DirectoryEntryPlus>>>,
-    fs: Weak<OverlayFs>,
-}
-
-impl Drop for HandleData {
-    fn drop(&mut self) {
-        if let Some(snapshot) = self.dir_snapshot.get_mut().take()
-            && let Some(fs) = self.fs.upgrade()
-        {
-            tokio::spawn(async move {
-                for entry in snapshot.iter().skip(2) {
-                    fs.forget_one(entry.inode, 1).await;
-                }
-            });
-        }
-    }
 }
 
 // RealInode is a wrapper of one inode in specific layer.
@@ -1000,7 +979,7 @@ fn entry_type_from_mode(mode: libc::mode_t) -> u8 {
     }
 }
 impl OverlayFs {
-    fn new_inner(
+    pub fn new(
         upper: Option<Arc<BoxedLayer>>,
         lowers: Vec<Arc<BoxedLayer>>,
         params: Config,
@@ -1019,30 +998,7 @@ impl OverlayFs {
             killpriv_v2: AtomicBool::new(false),
             perfile_dax: AtomicBool::new(false),
             root_inodes: root_inode,
-            fs: Weak::new(),
         })
-    }
-
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(
-        upper: Option<Arc<BoxedLayer>>,
-        lowers: Vec<Arc<BoxedLayer>>,
-        params: Config,
-        root_inode: u64,
-    ) -> Result<ArcOverlayFs> {
-        // let fs = OverlayFs::new_inner(upper, lowers, params, root_inode)?;
-        // let arc_fs = Arc::new(fs);
-        // let weak_fs = Arc::downgrade(&arc_fs);
-        // let fs_mut = unsafe { &mut *(Arc::as_ptr(&arc_fs) as *mut OverlayFs) };
-        // fs_mut.fs = weak_fs;
-        // Ok(ArcOverlayFs(arc_fs))
-        let mut fs_template = OverlayFs::new_inner(upper, lowers, params, root_inode)?;
-        let arc_fs = Arc::new_cyclic(|weak_self| {
-            // Move the pre-created template in and finish initialization.
-            fs_template.fs = weak_self.clone();
-            fs_template
-        });
-        Ok(ArcOverlayFs(arc_fs))
     }
 
     pub fn root_inode(&self) -> Inode {
@@ -1414,16 +1370,18 @@ impl OverlayFs {
     > {
         let snapshot = self.get_or_create_dir_snapshot(ctx, inode, handle).await?;
 
-        let entries: Vec<std::result::Result<DirectoryEntryPlus, Errno>> =
-            if offset < snapshot.len() as u64 {
-                snapshot
-                    .iter()
-                    .skip(offset as usize)
-                    .map(|entry| Ok(entry.clone()))
-                    .collect()
-            } else {
-                vec![]
-            };
+        let mut entries = Vec::new();
+        if offset < snapshot.len() as u64 {
+            for entry in snapshot.iter().skip(offset as usize) {
+                // Increment lookup count for readdirplus as we are handing out a reference to the kernel.
+                // We must do this here, not in snapshot creation, and we must NOT decrement it in HandleData drop.
+                // The kernel will send a FORGET request when it's done with the entry.
+                if let Some(node) = self.get_all_inode(entry.inode).await {
+                    node.lookups.fetch_add(1, Ordering::Relaxed);
+                }
+                entries.push(Ok(entry.clone()));
+            }
+        }
 
         Ok(iter(entries))
     }
@@ -1448,7 +1406,6 @@ impl OverlayFs {
                     node,
                     real_handle: None,
                     dir_snapshot: Mutex::new(None),
-                    fs: self.fs.clone(),
                 })
             }
         };
@@ -1504,7 +1461,6 @@ impl OverlayFs {
             }
             let mut st_child = child.stat64(ctx).await?;
             st_child.attr.ino = child.inode;
-            child.lookups.fetch_add(1, Ordering::Relaxed);
             entries.push(DirectoryEntryPlus {
                 inode: child.inode,
                 generation: 0,
@@ -1516,6 +1472,7 @@ impl OverlayFs {
                 attr_ttl: st_child.ttl,
             });
         }
+        drop(children);
 
         let mut snapshot_guard = handle_data.dir_snapshot.lock().await;
         if snapshot_guard.is_none() {
@@ -1848,7 +1805,6 @@ impl OverlayFs {
                             handle: AtomicU64::new(hd),
                         }),
                         dir_snapshot: Mutex::new(None),
-                        fs: self.fs.clone(),
                     };
                     self.handles
                         .lock()
@@ -2758,7 +2714,6 @@ impl OverlayFs {
                     handle: AtomicU64::new(0),
                 }),
                 dir_snapshot: Mutex::new(None),
-                fs: self.fs.clone(),
             };
             return Ok(Arc::new(handle_data));
         }
