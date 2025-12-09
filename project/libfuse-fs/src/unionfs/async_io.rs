@@ -14,7 +14,13 @@ use tracing::trace;
 
 impl Filesystem for OverlayFs {
     /// initialize filesystem. Called before any other filesystem method.
-    async fn init(&self, _req: Request) -> Result<ReplyInit> {
+    async fn init(&self, req: Request) -> Result<ReplyInit> {
+        for layer in self.lower_layers.iter() {
+            layer.init(req).await?;
+        }
+        if let Some(upper) = &self.upper_layer {
+            upper.init(req).await?;
+        }
         if self.config.do_import {
             self.import().await?;
         }

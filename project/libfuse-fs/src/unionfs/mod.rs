@@ -6,7 +6,7 @@
 mod async_io;
 pub mod config;
 mod inode_store;
-mod layer;
+pub mod layer;
 mod utils;
 
 //mod tempfile;
