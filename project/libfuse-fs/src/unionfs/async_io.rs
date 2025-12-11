@@ -9,6 +9,7 @@ use std::io::ErrorKind;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Mutex;
 use tracing::info;
 use tracing::trace;
 
@@ -364,6 +365,7 @@ impl Filesystem for OverlayFs {
                 inode,
                 handle: AtomicU64::new(h.fh),
             }),
+            dir_snapshot: Mutex::new(None),
         };
 
         self.handles.lock().await.insert(hd, Arc::new(handle_data));
@@ -672,6 +674,7 @@ impl Filesystem for OverlayFs {
                     inode: real_inode,
                     handle: AtomicU64::new(reply.fh),
                 }),
+                dir_snapshot: Mutex::new(None),
             }),
         );
 

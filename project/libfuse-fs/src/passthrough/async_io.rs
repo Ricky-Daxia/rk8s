@@ -308,7 +308,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     ///   This is for external FUSE clients.
     /// - `mapping: false`: Returns the raw, unmapped host attributes. This is for internal
     ///   callers like `overlayfs`'s copy-up logic.
-    async fn do_getattr_inner(
+    pub(crate) async fn do_getattr_inner(
         &self,
         inode: Inode,
         handle: Option<Handle>,
@@ -366,7 +366,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// [`do_getattr_inner`][Self::do_getattr_inner] with `mapping: false` to retrieve the raw, unmodified host
     /// attributes of a file. This is essential for the `copy_up` process to correctly
     /// preserve the original file ownership.
-    pub async fn do_getattr_helper(
+    pub(crate) async fn do_getattr_helper(
         &self,
         inode: Inode,
         handle: Option<Handle>,

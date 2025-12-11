@@ -1060,6 +1060,10 @@ impl Filesystem for OverlayFs {
                 .await
         }
     }
+
+    async fn interrupt(&self, _req: Request, _unique: u64) -> Result<()> {
+        Ok(())
+    }
 }
 #[cfg(test)]
 mod tests {
