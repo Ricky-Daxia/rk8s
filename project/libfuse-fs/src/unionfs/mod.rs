@@ -724,7 +724,7 @@ impl OverlayInode {
     ///    directory within the parent's upper-layer representation.
     ///
     /// Crucially, it preserves the original directory's ownership (UID/GID) and permissions
-    /// by using [`do_getattr_helper`][crate::unionfs::layer::Layer::do_getattr_helper] and
+    /// by using [`getattr_with_mapping`][crate::unionfs::layer::Layer::getattr_with_mapping] and
     /// [`mkdir_with_context`][crate::unionfs::layer::Layer::mkdir_with_context] with [`OperationContext`][crate::context::OperationContext].
     pub async fn create_upper_dir(
         self: Arc<Self>,
