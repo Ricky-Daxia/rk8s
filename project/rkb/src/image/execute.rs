@@ -90,16 +90,19 @@ impl<P: AsRef<Path>> InstructionExt<P> for RunInstruction {
             }
             ShellOrExecExpr::Shell(shell_expr) => {
                 command_args.extend(vec!["/bin/sh".to_owned(), "-c".to_owned()]);
+                let mut script = String::new();
                 for component in shell_expr.components.iter() {
                     match component {
                         BreakableStringComponent::Comment(_) => {}
                         BreakableStringComponent::String(spanned_string) => {
-                            command_args.push(spanned_string.content.as_str().to_owned());
+                            script.push_str(&spanned_string.content);
                         }
                     }
                 }
+                command_args.push(script);
             }
         }
+        println!("Executing RUN command: {:?}", command_args);
 
         let envp: Vec<String> = ctx
             .image_config
