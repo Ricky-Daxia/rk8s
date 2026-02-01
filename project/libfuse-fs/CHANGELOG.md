@@ -2,7 +2,7 @@
 
 ### Fixed
 
-- passthroughfs: ignore ESTALE error
+- passthroughfs: suppress logging for ESTALE errors in getattr
 
 # 0.1.9 (December 11th, 2025)
 

@@ -28,11 +28,9 @@ async fn test_with_vm() -> Result<()> {
             for (step_name, cmd) in steps {
                 let start = std::time::Instant::now();
                 println!("➜ Running step: [{}]", step_name);
-                
                 let res = vm.exec(cmd)
                     .await
                     .with_context(|| format!("Step failed: '{}' \nCommand: {}", step_name, cmd))?;
-                
                 println!("  ✓ Finished in {:?}", start.elapsed());
                 println!("  → STDOUT:\n{}", str::from_utf8(&res.stdout)?.trim());
                 println!("  → STDERR:\n{}", str::from_utf8(&res.stderr)?.trim());

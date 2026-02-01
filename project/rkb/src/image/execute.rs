@@ -102,7 +102,7 @@ impl<P: AsRef<Path>> InstructionExt<P> for RunInstruction {
                 command_args.push(script);
             }
         }
-        println!("Executing RUN command: {:?}", command_args);
+        // println!("Executing RUN command: {:?}", command_args);
 
         let envp: Vec<String> = ctx
             .image_config
