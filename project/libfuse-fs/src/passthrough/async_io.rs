@@ -336,7 +336,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // trace!("FS {} passthrough: do_getattr: after stat", self.uuid);
 
         let mut st = st.map_err(|e| {
-            error!("fuse: do_getattr stat failed ino {inode} err {e:?}");
+            if e.raw_os_error() == Some(libc::ESTALE) {
+                // debug!("fuse: do_getattr stat failed ino {inode} err {e:?}");
+                // ignore
+            } else {
+                error!("fuse: do_getattr stat failed ino {inode} err {e:?}");
+            }
             e
         })?;
         st.st_ino = inode;
