@@ -16,6 +16,10 @@ pub struct Config {
     pub metadata_dir: PathBuf,
     pub default_registry: String,
     pub is_root: bool,
+    /// Container rootfs mount mode: true=persistent overlay mount, false=traditional cp mode
+    pub use_overlay_rootfs: bool,
+    /// Overlay backend: true=libfuse (unprivileged), false=Linux native (requires root)
+    pub use_libfuse_overlay: bool,
 }
 
 impl Config {
@@ -58,6 +62,12 @@ impl Config {
             metadata_dir,
             default_registry: String::from(REGISTRY),
             is_root,
+            use_overlay_rootfs: std::env::var("RKFORGE_OVERLAY_ROOTFS")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            use_libfuse_overlay: std::env::var("RKFORGE_USE_LIBFUSE")
+                .map(|v| v == "1")
+                .unwrap_or(false),
         })
     }
 }

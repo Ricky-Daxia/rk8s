@@ -7334,6 +7334,7 @@ dependencies = [
  "hickory-server",
  "http-body 0.4.6",
  "hyper 0.14.32",
+ "ipc-channel",
  "ipnetwork",
  "json",
  "lazy_static",

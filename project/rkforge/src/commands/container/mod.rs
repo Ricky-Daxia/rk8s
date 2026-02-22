@@ -1,3 +1,6 @@
+pub mod rootfs_mount;
+
+use self::rootfs_mount::RootfsMount;
 use crate::{
     commands::{
         Exec, ExecContainer,
@@ -5,9 +8,10 @@ use crate::{
         create, delete, exec, list, load_container, start,
         volume::parse_key_val,
     },
+    config::image::CONFIG,
     pull,
 };
-use anyhow::{Ok, Result, anyhow};
+use anyhow::{Context, Ok, Result, anyhow};
 use chrono::{DateTime, Local};
 use clap::Subcommand;
 use common::ContainerSpec;
@@ -21,7 +25,9 @@ use liboci_cli::{Create, Delete, List, Start};
 use libruntime::cri::config::ContainerConfigBuilder;
 use libruntime::oci;
 use libruntime::rootpath;
-use libruntime::utils::{ImageType, determine_image, sync_handle_oci_image};
+use libruntime::utils::{
+    ImageType, determine_image, sync_handle_oci_image, sync_handle_oci_image_no_copy,
+};
 use libruntime::volume::{VolumeManager, VolumePattern, string_to_pattern};
 use libruntime::{
     cri::cri_api::{ContainerConfig, CreateContainerResponse, Mount},
@@ -42,7 +48,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tabwriter::TabWriter;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 struct RkforgeImagePuller {}
 
@@ -115,6 +121,8 @@ pub struct ContainerRunner {
     ip: Option<IpAddr>,
 
     compose_assigned_ip: Option<IpAddr>,
+    /// Persistent overlay rootfs mount (None when disabled)
+    rootfs_mount: Option<RootfsMount>,
 }
 
 impl ContainerRunner {
@@ -133,8 +141,13 @@ impl ContainerRunner {
     pub fn from_spec(mut spec: ContainerSpec, root_path: Option<PathBuf>) -> Result<Self> {
         let container_id = spec.name.clone();
 
-        // image pull/push support
-        let (builder, bundle_path) = handle_image_typ(&spec)?;
+        // Choose overlay or traditional cp path based on configuration switch
+        let (builder, bundle_path, rootfs_mount) = if CONFIG.use_overlay_rootfs {
+            handle_image_with_overlay(&spec)?
+        } else {
+            let (b, bp) = handle_image_typ(&spec)?;
+            (b, bp, None)
+        };
         if builder.is_some() {
             spec.image = bundle_path;
         }
@@ -151,6 +164,7 @@ impl ContainerRunner {
             volumes: None,
             ip: None,
             compose_assigned_ip: None,
+            rootfs_mount,
         })
     }
 
@@ -164,8 +178,13 @@ impl ContainerRunner {
 
         let mut container_spec: ContainerSpec = serde_yaml::from_str(&content)?;
 
-        // image pull/push support
-        let (builder, bundle_path) = handle_image_typ(&container_spec)?;
+        // Choose overlay or traditional cp path based on configuration switch
+        let (builder, bundle_path, rootfs_mount) = if CONFIG.use_overlay_rootfs {
+            handle_image_with_overlay(&container_spec)?
+        } else {
+            let (b, bp) = handle_image_typ(&container_spec)?;
+            (b, bp, None)
+        };
         if builder.is_some() {
             container_spec.image = bundle_path;
         }
@@ -181,6 +200,7 @@ impl ContainerRunner {
             volumes,
             ip: None,
             compose_assigned_ip: None,
+            rootfs_mount,
         })
     }
 
@@ -211,6 +231,7 @@ impl ContainerRunner {
             volumes: None,
             ip: None,
             compose_assigned_ip: None,
+            rootfs_mount: None,
         })
     }
 
@@ -318,10 +339,20 @@ impl ContainerRunner {
 
         let mut spec = Spec::default();
 
-        let root = RootBuilder::default()
-            .readonly(false)
-            .build()
-            .unwrap_or_default();
+        let root = if self.rootfs_mount.is_some() {
+            // Overlay persistent mount mode: use merged directory
+            RootBuilder::default()
+                .path("merged")
+                .readonly(false)
+                .build()
+                .unwrap_or_default()
+        } else {
+            // Traditional cp mode: use default rootfs
+            RootBuilder::default()
+                .readonly(false)
+                .build()
+                .unwrap_or_default()
+        };
         spec.set_root(Some(root));
 
         // use the default namespace configuration
@@ -613,25 +644,45 @@ pub fn state_container(id: &str) -> Result<()> {
 
 /// command delete
 pub fn delete_container(id: &str) -> Result<()> {
+    let delete_start = std::time::Instant::now();
     let root_path = rootpath::determine(None, &*create_syscall())?;
     is_container_exist(id, &root_path)?;
-    let delete_args = Delete {
-        container_id: id.to_string(),
-        force: true,
-    };
-    // delete the network
+
+    // Get bundle_path before delete (container state will be cleaned up after delete)
     let container = load_container(&root_path, id)?;
+    let bundle_path = container.bundle().to_path_buf();
     let pid = container
         .pid()
         .ok_or(anyhow!("invalid container {} can't find pid", id))?;
     remove_container_network(pid)?;
 
+    let delete_args = Delete {
+        container_id: id.to_string(),
+        force: true,
+    };
+    let t0 = std::time::Instant::now();
     delete(delete_args, root_path)?;
+    debug!("youki delete took {:?}", t0.elapsed());
 
+    // Stop overlay rootfs mount
+    if let Some(rootfs_mount) = RootfsMount::load(&bundle_path)?
+        && let Err(e) = rootfs_mount.stop()
+    {
+        error!("Failed to stop rootfs overlay mount for {id}: {e}");
+    }
+
+    info!(
+        "delete_container({id}) total took {:?}",
+        delete_start.elapsed()
+    );
     Ok(())
 }
 
 pub fn remove_container(root_path: &Path, state: &State) -> Result<()> {
+    // Get bundle_path before delete
+    let container = load_container(root_path, &state.id)?;
+    let bundle_path = container.bundle().to_path_buf();
+
     let delete_args = Delete {
         container_id: state.id.clone(),
         force: true,
@@ -642,6 +693,14 @@ pub fn remove_container(root_path: &Path, state: &State) -> Result<()> {
     // delete the network
     remove_container_network(Pid::from_raw(pid))?;
     delete(delete_args, root_path.to_path_buf())?;
+
+    // Stop overlay rootfs mount
+    if let Some(rootfs_mount) = RootfsMount::load(&bundle_path)?
+        && let Err(e) = rootfs_mount.stop()
+    {
+        error!("Failed to stop rootfs overlay mount for {}: {e}", &state.id);
+    }
+
     Ok(())
 }
 
@@ -771,6 +830,49 @@ pub fn handle_image_typ(
         return Ok((Some(builder), bundle_path));
     }
     Ok((None, "".to_string()))
+}
+
+/// Handle image using persistent overlay mount, without executing cp -a.
+///
+/// Returns `(config_builder, bundle_path, rootfs_mount)`.
+fn handle_image_with_overlay(
+    container_spec: &ContainerSpec,
+) -> Result<(Option<ContainerConfigBuilder>, String, Option<RootfsMount>)> {
+    let puller = RkforgeImagePuller {};
+    if let ImageType::OCIImage = determine_image(&container_spec.image)? {
+        // Pull image, get config + layers (without executing mount+cp)
+        let (image_config, bundle_path, layers) =
+            sync_handle_oci_image_no_copy(&puller, &container_spec.image)?;
+
+        // Prepare overlay directory structure
+        let (lower_dirs, upper_dir, work_dir, merged_dir) = tokio::runtime::Runtime::new()
+            .context("Failed to create tokio runtime")?
+            .block_on(libruntime::bundle::prepare_overlay_dirs(
+                &bundle_path,
+                &layers,
+            ))?;
+
+        // Start background overlay daemon
+        let rootfs_mount = RootfsMount::start(
+            &lower_dirs,
+            &upper_dir,
+            &work_dir,
+            &merged_dir,
+            &PathBuf::from(&bundle_path),
+            CONFIG.use_libfuse_overlay,
+        )?;
+
+        // Build config builder
+        let mut builder = ContainerConfigBuilder::default();
+        if let Some(config) = image_config.config() {
+            builder.args_from_image_config(config.entrypoint(), config.cmd());
+            builder.envs_from_image_config(config.env());
+            builder.work_dir(config.working_dir());
+        }
+
+        return Ok((Some(builder), bundle_path, Some(rootfs_mount)));
+    }
+    Ok((None, "".to_string(), None))
 }
 
 pub fn container_execute(cmd: ContainerCommand) -> Result<()> {
