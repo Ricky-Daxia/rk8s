@@ -1,10 +1,14 @@
 use std::{collections::HashMap, sync::Arc};
 
+#[cfg(feature = "quic")]
+use async_trait::async_trait;
 use curp_external_api::{
     InflightId,
     cmd::{ConflictCheck, PbCodec, PbSerializeError},
     conflict::EntryId,
 };
+#[cfg(feature = "quic")]
+use futures::Stream;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
@@ -67,8 +71,204 @@ mod metrics;
 pub(crate) mod connect;
 pub(crate) use connect::{connect, connects, inner_connects};
 
+#[cfg(feature = "quic")]
+#[allow(unused_imports)]
+pub(crate) use connect::{quic_connect, quic_connects, quic_inner_connects};
+
 /// Auto reconnect connection
 mod reconnect;
+
+/// Transport configuration
+pub(crate) mod transport;
+#[allow(unused_imports)]
+pub(crate) use transport::TransportConfig;
+
+/// QUIC transport implementation
+#[cfg(feature = "quic")]
+pub(crate) mod quic_transport;
+
+#[cfg(feature = "quic")]
+pub use quic_transport::{DnsFallback, MethodId, QuicChannel, QuicGrpcServer};
+
+#[doc(hidden)]
+#[cfg(all(feature = "quic", any(test, feature = "quic-test")))]
+pub use quic_transport::ALL_METHOD_IDS;
+
+// ============================================================================
+// Transport-agnostic service traits
+// ============================================================================
+
+/// Generic key-value metadata container
+///
+/// Carries three types of data:
+/// 1. bypass flag — key="bypass", value="true"
+/// 2. auth token — key="token", value=<jwt>
+/// 3. tracing context — W3C Trace Context keys (traceparent, tracestate, etc.),
+///    dynamically injected by OpenTelemetry Propagator
+///
+/// Client side: inject tracing context into Metadata, then serialize to QUIC frame header.
+/// Server side: rebuild `tonic::metadata::MetadataMap` from Metadata for `extract_span()`,
+///              and directly read bypass/token.
+#[cfg(feature = "quic")]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Metadata {
+    /// Key-value pairs
+    pairs: Vec<(String, String)>,
+}
+
+#[cfg(feature = "quic")]
+impl Metadata {
+    /// Create a new empty metadata
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn new() -> Self {
+        Self { pairs: Vec::new() }
+    }
+
+    /// Insert a key-value pair
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.pairs.push((key.into(), value.into()));
+    }
+
+    /// Get value by key (last-wins semantics for duplicate keys)
+    #[inline]
+    pub(crate) fn get(&self, key: &str) -> Option<&str> {
+        self.pairs
+            .iter()
+            .rfind(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Check if request is bypassed
+    #[inline]
+    pub(crate) fn is_bypassed(&self) -> bool {
+        self.get("bypass").is_some()
+    }
+
+    /// Get auth token
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn token(&self) -> Option<&str> {
+        self.get("token")
+    }
+
+    /// Iterate over all key-value pairs (for serialization)
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.pairs.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// Rebuild from deserialized key-value pairs
+    #[inline]
+    pub(crate) fn from_pairs(pairs: Vec<(String, String)>) -> Self {
+        Self { pairs }
+    }
+
+    /// Convert to `tonic::metadata::MetadataMap` (for server-side `extract_span`)
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn to_metadata_map(&self) -> tonic::metadata::MetadataMap {
+        use tonic::metadata::{MetadataKey, MetadataValue};
+
+        let mut map = tonic::metadata::MetadataMap::new();
+        for (k, v) in &self.pairs {
+            if let (Ok(key), Ok(val)) = (
+                k.parse::<MetadataKey<tonic::metadata::Ascii>>(),
+                v.parse::<MetadataValue<tonic::metadata::Ascii>>(),
+            ) {
+                let _ig = map.insert(key, val);
+            }
+        }
+        map
+    }
+}
+
+/// Transport-agnostic service trait for external protocol
+///
+/// This trait abstracts the RPC methods so that both tonic and QUIC
+/// implementations can be used interchangeably by the dispatcher.
+#[cfg(feature = "quic")]
+#[async_trait]
+pub(crate) trait CurpService: Send + Sync + 'static {
+    /// Handle propose stream request
+    async fn propose_stream(
+        &self,
+        req: ProposeRequest,
+        meta: Metadata,
+    ) -> Result<Box<dyn Stream<Item = Result<OpResponse, CurpError>> + Send + Unpin>, CurpError>;
+
+    /// Handle record request
+    fn record(&self, req: RecordRequest, meta: Metadata) -> Result<RecordResponse, CurpError>;
+
+    /// Handle read index request
+    fn read_index(&self, meta: Metadata) -> Result<ReadIndexResponse, CurpError>;
+
+    /// Handle shutdown request
+    async fn shutdown(
+        &self,
+        req: ShutdownRequest,
+        meta: Metadata,
+    ) -> Result<ShutdownResponse, CurpError>;
+
+    /// Handle propose conf change request
+    async fn propose_conf_change(
+        &self,
+        req: ProposeConfChangeRequest,
+        meta: Metadata,
+    ) -> Result<ProposeConfChangeResponse, CurpError>;
+
+    /// Handle publish request
+    fn publish(&self, req: PublishRequest, meta: Metadata) -> Result<PublishResponse, CurpError>;
+
+    /// Handle fetch cluster request
+    fn fetch_cluster(&self, req: FetchClusterRequest) -> Result<FetchClusterResponse, CurpError>;
+
+    /// Handle fetch read state request
+    fn fetch_read_state(
+        &self,
+        req: FetchReadStateRequest,
+    ) -> Result<FetchReadStateResponse, CurpError>;
+
+    /// Handle move leader request
+    async fn move_leader(&self, req: MoveLeaderRequest) -> Result<MoveLeaderResponse, CurpError>;
+
+    /// Handle lease keep alive stream
+    async fn lease_keep_alive(
+        &self,
+        stream: Box<dyn Stream<Item = Result<LeaseKeepAliveMsg, CurpError>> + Send + Unpin>,
+    ) -> Result<LeaseKeepAliveMsg, CurpError>;
+}
+
+/// Transport-agnostic service trait for internal protocol
+///
+/// This trait abstracts the internal RPC methods used for Raft consensus.
+#[cfg(feature = "quic")]
+#[async_trait]
+pub(crate) trait InnerCurpService: Send + Sync + 'static {
+    /// Handle append entries request
+    fn append_entries(
+        &self,
+        req: AppendEntriesRequest,
+    ) -> Result<AppendEntriesResponse, CurpError>;
+
+    /// Handle vote request
+    fn vote(&self, req: VoteRequest) -> Result<VoteResponse, CurpError>;
+
+    /// Handle install snapshot stream
+    async fn install_snapshot(
+        &self,
+        stream: Box<dyn Stream<Item = Result<InstallSnapshotRequest, CurpError>> + Send + Unpin>,
+    ) -> Result<InstallSnapshotResponse, CurpError>;
+
+    /// Trigger shutdown
+    fn trigger_shutdown(&self) -> Result<(), CurpError>;
+
+    /// Try to become leader now
+    async fn try_become_leader_now(&self) -> Result<(), CurpError>;
+}
 
 // Skip for generated code
 #[allow(

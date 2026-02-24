@@ -214,6 +214,8 @@ pub struct ClientBuilder {
     config: ClientConfig,
     /// Client tls config
     tls_config: Option<ClientTlsConfig>,
+    /// Transport configuration (default: Tonic)
+    transport: crate::rpc::transport::TransportConfig,
 }
 
 /// A client builder with bypass with local server
@@ -287,6 +289,37 @@ impl ClientBuilder {
         self
     }
 
+    /// Use QUIC transport (default is tonic gRPC)
+    #[cfg(feature = "quic")]
+    #[inline]
+    #[must_use]
+    pub fn quic_transport(mut self, quic_client: Arc<gm_quic::prelude::QuicClient>) -> Self {
+        self.transport = crate::rpc::transport::TransportConfig::Quic(
+            quic_client,
+            crate::rpc::quic_transport::channel::DnsFallback::Disabled,
+        );
+        self
+    }
+
+    /// Use QUIC transport with localhost DNS fallback (test only)
+    ///
+    /// When DNS resolution fails for a hostname, falls back to 127.0.0.1
+    /// with the original hostname as SNI. Only use this for testing with
+    /// fake hostnames like "s0.test".
+    #[cfg(all(feature = "quic", any(test, feature = "quic-test")))]
+    #[inline]
+    #[must_use]
+    pub fn quic_transport_for_test(
+        mut self,
+        quic_client: Arc<gm_quic::prelude::QuicClient>,
+    ) -> Self {
+        self.transport = crate::rpc::transport::TransportConfig::Quic(
+            quic_client,
+            crate::rpc::quic_transport::channel::DnsFallback::LocalhostForTest,
+        );
+        self
+    }
+
     /// Discover the initial states from some endpoints
     ///
     /// # Errors
@@ -294,6 +327,12 @@ impl ClientBuilder {
     /// Return `tonic::Status` for connection failure or some server errors.
     #[inline]
     pub async fn discover_from(mut self, addrs: Vec<String>) -> Result<Self, tonic::Status> {
+        #[cfg(feature = "quic")]
+        if matches!(self.transport, crate::rpc::TransportConfig::Quic(..)) {
+            return Err(tonic::Status::internal(
+                "discover_from uses tonic transport; use quic_discover_from for QUIC",
+            ));
+        }
         /// Sleep duration in secs when the cluster is unavailable
         const DISCOVER_SLEEP_DURATION: u64 = 1;
         loop {
@@ -357,6 +396,93 @@ impl ClientBuilder {
         Err(err)
     }
 
+    /// Discover the initial states from some endpoints using QUIC transport
+    ///
+    /// This is the QUIC equivalent of `discover_from`. It uses `QuicChannel`
+    /// to connect to the given addresses and fetch cluster information.
+    ///
+    /// # Errors
+    ///
+    /// Return `CurpError` for connection failure or some server errors.
+    #[cfg(feature = "quic")]
+    #[inline]
+    pub async fn quic_discover_from(
+        mut self,
+        addrs: Vec<String>,
+    ) -> Result<Self, crate::rpc::CurpError> {
+        use crate::rpc::{CurpError, MethodId, quic_transport::channel::QuicChannel};
+
+        let (quic_client, dns_fallback) = match self.transport {
+            crate::rpc::transport::TransportConfig::Quic(ref c, fallback) => {
+                (Arc::clone(c), fallback)
+            }
+            _ => {
+                return Err(CurpError::internal(
+                    "quic_discover_from requires quic_transport to be set",
+                ));
+            }
+        };
+
+        let propose_timeout = *self.config.propose_timeout();
+        let mut futs: FuturesUnordered<_> = addrs
+            .iter()
+            .map(|addr| {
+                let client = Arc::clone(&quic_client);
+                let addr = addr.clone();
+                async move {
+                    let channel = match dns_fallback {
+                        #[cfg(any(test, feature = "quic-test"))]
+                        crate::rpc::quic_transport::channel::DnsFallback::LocalhostForTest => {
+                            QuicChannel::connect_single_for_test(&addr, client).await?
+                        }
+                        crate::rpc::quic_transport::channel::DnsFallback::Disabled => {
+                            QuicChannel::connect_single(&addr, client).await?
+                        }
+                    };
+                    let resp: FetchClusterResponse = channel
+                        .unary_call(
+                            MethodId::FetchCluster,
+                            FetchClusterRequest::default(),
+                            vec![],
+                            propose_timeout,
+                        )
+                        .await?;
+                    Ok::<FetchClusterResponse, CurpError>(resp)
+                }
+            })
+            .collect();
+
+        let mut err = CurpError::internal("addrs is empty");
+        while let Some(r) = futs.next().await {
+            match r {
+                Ok(r) => {
+                    self.cluster_version = Some(r.cluster_version);
+                    if let Some(ref id) = r.leader_id {
+                        self.leader_state = Some((id.into(), r.term));
+                    }
+                    self.all_members = if self.is_raw_curp {
+                        Some(r.into_peer_urls())
+                    } else {
+                        Some(Self::quic_ensure_no_empty_address(r.into_client_urls())?)
+                    };
+                    return Ok(self);
+                }
+                Err(e) => err = e,
+            }
+        }
+        Err(err)
+    }
+
+    /// Ensures that no server has an empty list of addresses (QUIC variant)
+    #[cfg(feature = "quic")]
+    fn quic_ensure_no_empty_address(
+        urls: HashMap<ServerId, Vec<String>>,
+    ) -> Result<HashMap<ServerId, Vec<String>>, crate::rpc::CurpError> {
+        (!urls.values().any(Vec::is_empty))
+            .then_some(urls)
+            .ok_or(crate::rpc::CurpError::internal("cluster not published"))
+    }
+
     /// Ensures that no server has an empty list of addresses.
     #[allow(clippy::result_large_err)]
     fn ensure_no_empty_address(
@@ -382,6 +508,7 @@ impl ClientBuilder {
             builder.set_leader_state(id, term);
         }
         builder.set_is_raw_curp(self.is_raw_curp);
+        builder.set_transport(self.transport.clone());
         builder
     }
 

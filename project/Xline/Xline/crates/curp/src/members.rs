@@ -453,7 +453,7 @@ pub async fn get_cluster_info_from_remote(
         if let Ok(cluster_res) = result {
             info!("get cluster info from remote success: {:?}", cluster_res);
             return Some(ClusterInfo::from_cluster(
-                cluster_res.into_inner(),
+                cluster_res,
                 self_peer_urls,
                 self_client_urls.as_slice(),
                 self_name,

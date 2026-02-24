@@ -829,7 +829,8 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> CurpNode<C, CE, RC> {
     #[inline]
     #[allow(clippy::too_many_arguments)] // TODO: refactor this use builder pattern
     #[allow(clippy::needless_pass_by_value)] // The value should be consumed
-    pub(super) fn new(
+    /// Create a new `CurpNode`
+    pub(super) fn new_with_transport(
         cluster_info: Arc<ClusterInfo>,
         is_leader: bool,
         cmd_executor: Arc<CE>,
@@ -841,14 +842,23 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> CurpNode<C, CE, RC> {
         client_tls_config: Option<ClientTlsConfig>,
         sps: Vec<SpObject<C>>,
         ucps: Vec<UcpObject<C>>,
+        transport: rpc::TransportConfig,
     ) -> Result<Self, CurpError> {
         let sync_events = cluster_info
             .peers_ids()
             .into_iter()
             .map(|server_id| (server_id, Arc::new(Event::new())))
             .collect();
-        let connects =
-            rpc::inner_connects(cluster_info.peers_addrs(), client_tls_config.as_ref()).collect();
+        let connects = match transport {
+            rpc::TransportConfig::Tonic => {
+                rpc::inner_connects(cluster_info.peers_addrs(), client_tls_config.as_ref())
+                    .collect()
+            }
+            #[cfg(feature = "quic")]
+            rpc::TransportConfig::Quic(ref client, dns_fallback) => {
+                rpc::quic_inner_connects(cluster_info.peers_addrs(), client, dns_fallback).collect()
+            }
+        };
         let cmd_board = Arc::new(RwLock::new(CommandBoard::new()));
         let lease_manager = Arc::new(RwLock::new(LeaseManager::new()));
         let last_applied = cmd_executor
@@ -989,10 +999,10 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> CurpNode<C, CE, RC> {
             .filter_map(|(id, resp)| async move {
                 match resp {
                     Err(e) => {
-                        warn!("request vote from {id} failed, {e}");
+                        warn!("request vote from {id} failed, {e:?}");
                         None
                     }
-                    Ok(resp) => Some((id, resp.into_inner())),
+                    Ok(resp) => Some((id, resp)),
                 }
             });
         pin_mut!(resps);
@@ -1061,8 +1071,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> CurpNode<C, CE, RC> {
 
         let resp = connect
             .append_entries(req, curp.cfg().rpc_timeout)
-            .await?
-            .into_inner();
+            .await?;
 
         let Ok(ae_succeed) = curp.handle_append_entries_resp(
             connect.id(),
@@ -1088,8 +1097,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> CurpNode<C, CE, RC> {
         let meta = snapshot.meta;
         let resp = connect
             .install_snapshot(curp.term(), curp.id(), snapshot)
-            .await?
-            .into_inner();
+            .await?;
         Ok(curp
             .handle_snapshot_resp(connect.id(), meta, resp.term)
             .is_err())
@@ -1171,7 +1179,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> CurpNode<C, CE, RC> {
                             {
                                 match connect.trigger_shutdown().await {
                                     Err(e) => {
-                                        warn!("trigger shutdown to {} failed, {e}", connect_id);
+                                        warn!("trigger shutdown to {} failed, {e:?}", connect_id);
                                     }
                                     _ => {
                                         debug!("trigger shutdown to {} success", connect_id);
@@ -1203,7 +1211,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> CurpNode<C, CE, RC> {
                     Ok(false) => {}
                 },
                 Err(err) => {
-                    warn!("failed to receive snapshot result, {err}");
+                    warn!("failed to receive snapshot result, {err:?}");
                 }
             },
         }
@@ -1244,7 +1252,7 @@ mod tests {
         mock_connect1
             .expect_append_entries()
             .times(1..)
-            .returning(|_, _| Ok(tonic::Response::new(AppendEntriesResponse::new_accept(0))));
+            .returning(|_, _| Ok(AppendEntriesResponse::new_accept(0)));
         let s1_id = curp.cluster().get_id_by_name("S1").unwrap();
         mock_connect1.expect_id().return_const(s1_id);
         let remove_event = Arc::new(Event::new());
@@ -1278,9 +1286,9 @@ mod tests {
 
         let mut mock_connect1 = MockInnerConnectApi::default();
         mock_connect1.expect_vote().returning(|req, _| {
-            Ok(tonic::Response::new(
+            Ok(
                 VoteResponse::new_accept::<TestCommand>(req.term, vec![]).unwrap(),
-            ))
+            )
         });
         let s1_id = curp.cluster().get_id_by_name("S1").unwrap();
         mock_connect1.expect_id().return_const(s1_id);
@@ -1291,9 +1299,9 @@ mod tests {
 
         let mut mock_connect2 = MockInnerConnectApi::default();
         mock_connect2.expect_vote().returning(|req, _| {
-            Ok(tonic::Response::new(
+            Ok(
                 VoteResponse::new_accept::<TestCommand>(req.term, vec![]).unwrap(),
-            ))
+            )
         });
         let s2_id = curp.cluster().get_id_by_name("S2").unwrap();
         mock_connect2.expect_id().return_const(s2_id);
@@ -1335,9 +1343,9 @@ mod tests {
 
         let mut mock_connect1 = MockInnerConnectApi::default();
         mock_connect1.expect_vote().returning(|req, _| {
-            Ok(tonic::Response::new(
+            Ok(
                 VoteResponse::new_accept::<TestCommand>(req.term, vec![]).unwrap(),
-            ))
+            )
         });
         mock_connect1.expect_id().return_const(s1_id);
         curp.set_connect(
@@ -1347,9 +1355,9 @@ mod tests {
 
         let mut mock_connect2 = MockInnerConnectApi::default();
         mock_connect2.expect_vote().returning(|req, _| {
-            Ok(tonic::Response::new(
+            Ok(
                 VoteResponse::new_accept::<TestCommand>(req.term, vec![]).unwrap(),
-            ))
+            )
         });
         mock_connect2.expect_id().return_const(s2_id);
         curp.set_connect(

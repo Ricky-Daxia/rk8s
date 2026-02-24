@@ -17,6 +17,7 @@ use crate::{
     rpc::{
         self, CurpError, FetchClusterRequest, FetchClusterResponse, Protocol,
         connect::{BypassedConnect, ConnectApi},
+        transport::TransportConfig,
     },
 };
 
@@ -42,6 +43,8 @@ struct StateStatic {
     leader_notifier: Arc<Event>,
     /// Client tls config
     tls_config: Option<ClientTlsConfig>,
+    /// Transport configuration
+    transport: TransportConfig,
 }
 
 /// Mutable client state
@@ -90,6 +93,7 @@ impl State {
                 leader_notifier: Arc::new(Event::new()),
                 tls_config,
                 is_raw_curp: true,
+                transport: TransportConfig::default(),
             },
             // Sets the client id to non-zero to avoid waiting for client id in tests
             client_id: Arc::new(AtomicU64::new(1)),
@@ -144,7 +148,7 @@ impl State {
         let resp = rand_conn
             .fetch_cluster(FetchClusterRequest::default(), REFRESH_TIMEOUT)
             .await;
-        self.check_and_update(&resp?.into_inner()).await?;
+        self.check_and_update(&resp?).await?;
         Ok(())
     }
 
@@ -289,7 +293,7 @@ impl State {
     pub(super) async fn check_and_update(
         &self,
         res: &FetchClusterResponse,
-    ) -> Result<(), tonic::transport::Error> {
+    ) -> Result<(), CurpError> {
         let mut state = self.mutable.write().await;
         if !self.check_and_update_leader_inner(
             &mut state,
@@ -326,7 +330,15 @@ impl State {
                     .remove(&diff)
                     .unwrap_or_else(|| unreachable!("{diff} must in new member addrs"));
                 debug!("client connects to a new server({diff}), address({addrs:?})");
-                let new_conn = rpc::connect(diff, addrs, self.immutable.tls_config.clone());
+                let new_conn = match self.immutable.transport {
+                    TransportConfig::Tonic => {
+                        rpc::connect(diff, addrs, self.immutable.tls_config.clone())
+                    }
+                    #[cfg(feature = "quic")]
+                    TransportConfig::Quic(ref client, dns_fallback) => {
+                        rpc::quic_connect(diff, addrs, client, dns_fallback)
+                    }
+                };
                 let _ig = e.insert(new_conn);
             } else {
                 debug!("client removes old server({diff})");
@@ -385,6 +397,8 @@ pub(super) struct StateBuilder {
     tls_config: Option<ClientTlsConfig>,
     /// is current client send request to raw curp server
     is_raw_curp: bool,
+    /// Transport configuration
+    transport: TransportConfig,
 }
 
 impl StateBuilder {
@@ -399,6 +413,7 @@ impl StateBuilder {
             cluster_version: None,
             tls_config,
             is_raw_curp: false,
+            transport: TransportConfig::default(),
         }
     }
 
@@ -417,6 +432,11 @@ impl StateBuilder {
         self.cluster_version = Some(cluster_version);
     }
 
+    /// Set the transport configuration
+    pub(super) fn set_transport(&mut self, transport: TransportConfig) {
+        self.transport = transport;
+    }
+
     /// Build the state with local server
     pub(super) fn build_bypassed<P: Protocol>(
         mut self,
@@ -426,8 +446,7 @@ impl StateBuilder {
         debug!("client bypassed server({local_server_id})");
 
         let _ig = self.all_members.remove(&local_server_id);
-        let mut connects: HashMap<_, _> =
-            rpc::connects(self.all_members.clone(), self.tls_config.as_ref()).collect();
+        let mut connects: HashMap<_, _> = self.make_connects();
         let __ig = connects.insert(
             local_server_id,
             Arc::new(BypassedConnect::new(local_server_id, local_server)),
@@ -445,6 +464,7 @@ impl StateBuilder {
                 leader_notifier: Arc::new(Event::new()),
                 tls_config: self.tls_config.take(),
                 is_raw_curp: self.is_raw_curp,
+                transport: self.transport,
             },
             client_id: Arc::new(AtomicU64::new(0)),
         }
@@ -452,8 +472,7 @@ impl StateBuilder {
 
     /// Build the state
     pub(super) fn build(self) -> State {
-        let connects: HashMap<_, _> =
-            rpc::connects(self.all_members.clone(), self.tls_config.as_ref()).collect();
+        let connects: HashMap<_, _> = self.make_connects();
         State {
             mutable: RwLock::new(StateMut {
                 leader: self.leader_state.map(|state| state.0),
@@ -466,8 +485,22 @@ impl StateBuilder {
                 leader_notifier: Arc::new(Event::new()),
                 tls_config: self.tls_config,
                 is_raw_curp: self.is_raw_curp,
+                transport: self.transport,
             },
             client_id: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Create connects based on transport configuration
+    fn make_connects(&self) -> HashMap<ServerId, Arc<dyn ConnectApi>> {
+        match self.transport {
+            TransportConfig::Tonic => {
+                rpc::connects(self.all_members.clone(), self.tls_config.as_ref()).collect()
+            }
+            #[cfg(feature = "quic")]
+            TransportConfig::Quic(ref client, dns_fallback) => {
+                rpc::quic_connects(self.all_members.clone(), client, dns_fallback).collect()
+            }
         }
     }
 }

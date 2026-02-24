@@ -79,7 +79,7 @@ fn init_unary_client(
 async fn test_unary_fetch_clusters_serializable() {
     let connects = init_mocked_connects(3, |_id, conn| {
         conn.expect_fetch_cluster().return_once(|_req, _timeout| {
-            Ok(tonic::Response::new(FetchClusterResponse {
+            Ok(FetchClusterResponse {
                 leader_id: Some(0.into()),
                 term: 1,
                 cluster_id: 123,
@@ -89,7 +89,7 @@ async fn test_unary_fetch_clusters_serializable() {
                     Member::new(2, "S2".to_owned(), vec!["A2".to_owned()], Vec::new(), false),
                 ],
                 cluster_version: 1,
-            }))
+            })
         });
     });
     let unary = init_unary_client(connects, None, None, 0, 0, None);
@@ -116,13 +116,13 @@ async fn test_unary_fetch_clusters_serializable_local_first() {
                 } else {
                     panic!("other server's `fetch_cluster` should not be invoked");
                 };
-                Ok(tonic::Response::new(FetchClusterResponse {
+                Ok(FetchClusterResponse {
                     leader_id: Some(0.into()),
                     term: 1,
                     cluster_id: 123,
                     members,
                     cluster_version: 1,
-                }))
+                })
             });
     });
     let unary = init_unary_client(connects, Some(1), None, 0, 0, None);
@@ -179,7 +179,7 @@ async fn test_unary_fetch_clusters_linearizable() {
                     },
                     _ => unreachable!("there are only 5 nodes"),
                 };
-                Ok(tonic::Response::new(resp))
+                Ok(resp)
             });
     });
     let unary = init_unary_client(connects, None, None, 0, 0, None);
@@ -252,7 +252,7 @@ async fn test_unary_fetch_clusters_linearizable_failed() {
                     },
                     _ => unreachable!("there are only 5 nodes"),
                 };
-                Ok(tonic::Response::new(resp))
+                Ok(resp)
             });
     });
     let unary = init_unary_client(connects, None, None, 0, 0, None);
@@ -289,11 +289,11 @@ async fn test_unary_propose_fast_path_works() {
             .return_once(move |_req, _token, _timeout| {
                 assert_eq!(id, 0, "followers should not receive propose");
                 let resp = async_stream::stream! {
-                    yield Ok(build_propose_response(false));
+                    yield Ok::<_, CurpError>(build_propose_response(false));
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     yield Ok(build_synced_response());
                 };
-                Ok(tonic::Response::new(Box::new(resp)))
+                Ok(Box::new(resp))
             });
         conn.expect_record().return_once(move |_req, _timeout| {
             let resp = match id {
@@ -302,7 +302,7 @@ async fn test_unary_propose_fast_path_works() {
                 4 => RecordResponse { conflict: true },
                 _ => unreachable!("there are only 5 nodes"),
             };
-            Ok(tonic::Response::new(resp))
+            Ok(resp)
         });
     });
     let unary = init_unary_client(connects, None, Some(0), 1, 0, None);
@@ -322,11 +322,11 @@ async fn test_unary_propose_slow_path_works() {
             .return_once(move |_req, _token, _timeout| {
                 assert_eq!(id, 0, "followers should not receive propose");
                 let resp = async_stream::stream! {
-                    yield Ok(build_propose_response(false));
+                    yield Ok::<_, CurpError>(build_propose_response(false));
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     yield Ok(build_synced_response());
                 };
-                Ok(tonic::Response::new(Box::new(resp)))
+                Ok(Box::new(resp))
             });
         conn.expect_record().return_once(move |_req, _timeout| {
             let resp = match id {
@@ -335,7 +335,7 @@ async fn test_unary_propose_slow_path_works() {
                 4 => RecordResponse { conflict: true },
                 _ => unreachable!("there are only 5 nodes"),
             };
-            Ok(tonic::Response::new(resp))
+            Ok(resp)
         });
     });
 
@@ -365,11 +365,11 @@ async fn test_unary_propose_fast_path_fallback_slow_path() {
             .return_once(move |_req, _token, _timeout| {
                 assert_eq!(id, 0, "followers should not receive propose");
                 let resp = async_stream::stream! {
-                    yield Ok(build_propose_response(false));
+                    yield Ok::<_, CurpError>(build_propose_response(false));
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     yield Ok(build_synced_response());
                 };
-                Ok(tonic::Response::new(Box::new(resp)))
+                Ok(Box::new(resp))
             });
         // insufficient quorum
         conn.expect_record().return_once(move |_req, _timeout| {
@@ -379,7 +379,7 @@ async fn test_unary_propose_fast_path_fallback_slow_path() {
                 3 | 4 => RecordResponse { conflict: true },
                 _ => unreachable!("there are only 5 nodes"),
             };
-            Ok(tonic::Response::new(resp))
+            Ok(resp)
         });
     });
     let unary = init_unary_client(connects, None, Some(0), 1, 0, None);
@@ -490,7 +490,7 @@ async fn test_retry_propose_return_retry_error() {
         let connects = init_mocked_connects(5, |id, conn| {
             conn.expect_fetch_cluster()
                 .returning(move |_req, _timeout| {
-                    Ok(tonic::Response::new(FetchClusterResponse {
+                    Ok(FetchClusterResponse {
                         leader_id: Some(0.into()),
                         term: 2,
                         cluster_id: 123,
@@ -502,7 +502,7 @@ async fn test_retry_propose_return_retry_error() {
                             Member::new(4, "S4".to_owned(), vec!["A4".to_owned()], Vec::new(), false),
                         ],
                         cluster_version: 1,
-                    }))
+                    })
                 });
             if id == 0 {
                 let err = early_err.clone();
@@ -537,11 +537,11 @@ async fn test_read_index_success() {
             .return_once(move |_req, _token, _timeout| {
                 assert_eq!(id, 0, "followers should not receive propose");
                 let resp = async_stream::stream! {
-                    yield Ok(build_propose_response(false));
+                    yield Ok::<_, CurpError>(build_propose_response(false));
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     yield Ok(build_synced_response());
                 };
-                Ok(tonic::Response::new(Box::new(resp)))
+                Ok(Box::new(resp))
             });
         conn.expect_read_index().return_once(move |_timeout| {
             let resp = match id {
@@ -551,7 +551,7 @@ async fn test_read_index_success() {
                 _ => unreachable!("there are only 5 nodes"),
             };
 
-            Ok(tonic::Response::new(resp))
+            Ok(resp)
         });
     });
     let unary = init_unary_client(connects, None, Some(0), 1, 0, None);
@@ -571,10 +571,10 @@ async fn test_read_index_fail() {
             .return_once(move |_req, _token, _timeout| {
                 assert_eq!(id, 0, "followers should not receive propose");
                 let resp = async_stream::stream! {
-                    yield Ok(build_propose_response(false));
+                    yield Ok::<_, CurpError>(build_propose_response(false));
                     yield Ok(build_synced_response());
                 };
-                Ok(tonic::Response::new(Box::new(resp)))
+                Ok(Box::new(resp))
             });
         conn.expect_read_index().return_once(move |_timeout| {
             let resp = match id {
@@ -584,7 +584,7 @@ async fn test_read_index_fail() {
                 _ => unreachable!("there are only 5 nodes"),
             };
 
-            Ok(tonic::Response::new(resp))
+            Ok(resp)
         });
     });
     let unary = init_unary_client(connects, None, Some(0), 1, 0, None);
@@ -608,7 +608,7 @@ impl ConnectApi for MockedStreamConnectApi {
     }
 
     /// Update server addresses, the new addresses will override the old ones
-    async fn update_addrs(&self, _addrs: Vec<String>) -> Result<(), tonic::transport::Error> {
+    async fn update_addrs(&self, _addrs: Vec<String>) -> Result<(), CurpError> {
         Ok(())
     }
 
@@ -618,7 +618,7 @@ impl ConnectApi for MockedStreamConnectApi {
         _request: ProposeRequest,
         _token: Option<String>,
         _timeout: Duration,
-    ) -> Result<tonic::Response<Box<dyn Stream<Item = Result<OpResponse, Status>> + Send>>, CurpError>
+    ) -> Result<Box<dyn Stream<Item = Result<OpResponse, CurpError>> + Send>, CurpError>
     {
         unreachable!("please use MockedConnectApi")
     }
@@ -628,7 +628,7 @@ impl ConnectApi for MockedStreamConnectApi {
         &self,
         _request: RecordRequest,
         _timeout: Duration,
-    ) -> Result<tonic::Response<RecordResponse>, CurpError> {
+    ) -> Result<RecordResponse, CurpError> {
         unreachable!("please use MockedConnectApi")
     }
 
@@ -636,7 +636,7 @@ impl ConnectApi for MockedStreamConnectApi {
     async fn read_index(
         &self,
         _timeout: Duration,
-    ) -> Result<tonic::Response<ReadIndexResponse>, CurpError> {
+    ) -> Result<ReadIndexResponse, CurpError> {
         unreachable!("please use MockedConnectApi")
     }
 
@@ -645,7 +645,7 @@ impl ConnectApi for MockedStreamConnectApi {
         &self,
         _request: ProposeConfChangeRequest,
         _timeout: Duration,
-    ) -> Result<tonic::Response<ProposeConfChangeResponse>, CurpError> {
+    ) -> Result<ProposeConfChangeResponse, CurpError> {
         unreachable!("please use MockedConnectApi")
     }
 
@@ -654,7 +654,7 @@ impl ConnectApi for MockedStreamConnectApi {
         &self,
         _request: PublishRequest,
         _timeout: Duration,
-    ) -> Result<tonic::Response<PublishResponse>, CurpError> {
+    ) -> Result<PublishResponse, CurpError> {
         unreachable!("please use MockedConnectApi")
     }
 
@@ -663,7 +663,7 @@ impl ConnectApi for MockedStreamConnectApi {
         &self,
         _request: ShutdownRequest,
         _timeout: Duration,
-    ) -> Result<tonic::Response<ShutdownResponse>, CurpError> {
+    ) -> Result<ShutdownResponse, CurpError> {
         unreachable!("please use MockedConnectApi")
     }
 
@@ -672,7 +672,7 @@ impl ConnectApi for MockedStreamConnectApi {
         &self,
         _request: FetchClusterRequest,
         _timeout: Duration,
-    ) -> Result<tonic::Response<FetchClusterResponse>, CurpError> {
+    ) -> Result<FetchClusterResponse, CurpError> {
         unreachable!("please use MockedConnectApi")
     }
 
@@ -681,7 +681,7 @@ impl ConnectApi for MockedStreamConnectApi {
         &self,
         _request: FetchReadStateRequest,
         _timeout: Duration,
-    ) -> Result<tonic::Response<FetchReadStateResponse>, CurpError> {
+    ) -> Result<FetchReadStateResponse, CurpError> {
         unreachable!("please use MockedConnectApi")
     }
 
@@ -690,7 +690,7 @@ impl ConnectApi for MockedStreamConnectApi {
         &self,
         _request: MoveLeaderRequest,
         _timeout: Duration,
-    ) -> Result<tonic::Response<MoveLeaderResponse>, CurpError> {
+    ) -> Result<MoveLeaderResponse, CurpError> {
         unreachable!("please use MockedConnectApi")
     }
 

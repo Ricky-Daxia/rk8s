@@ -34,7 +34,6 @@ pub(super) struct FilePipeline {
     stopped: Arc<AtomicBool>,
     /// Join handle of the allocation task
     file_alloc_task_handle: Option<JoinHandle<()>>,
-    // #[cfg_attr(not(madsim), allow(unused))]
 
 }
 
