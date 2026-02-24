@@ -415,7 +415,8 @@ impl CsiClient {
         endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?
         )));
-        let connection = endpoint.connect(addr, "libcsi")?.await?;
+        // server_name must match a SAN in the server certificate (issued by libvault).
+        let connection = endpoint.connect(addr, server_name)?.await?;
         Ok(Self { connection })
     }
 
@@ -530,143 +531,152 @@ SlayerFS 提供了 `ClientBackend` trait 和 `LocalClient` / `VfsClient`，核�
 
 ### 7.2 后端实现策略
 
+#### SlayerFsBackend 结构
+
 ```rust
 // backend/slayerfs.rs
 
-use slayerfs::{LocalClient, ChunkLayout, VfsClient};
+use slayerfs::{LocalClient, ChunkLayout};
+
+/// Key in Volume::parameters used to persist the caller-supplied name
+/// across process restarts for create_volume idempotency.
+const PARAM_CSI_NAME: &str = "_csi_name";
 
 pub struct SlayerFsBackend {
-    /// SlayerFS 对象存储根目录
     object_root: PathBuf,
-    /// Chunk 布局配置
     layout: ChunkLayout,
-    /// 已创建的卷 → 对应的 VfsClient
+    /// Live SlayerFS clients, keyed by volume ID.
     volumes: DashMap<VolumeId, Arc<dyn ClientBackend>>,
+    /// Full volume metadata, keyed by volume ID.
+    volume_meta: DashMap<VolumeId, Volume>,
+    /// Maps the caller-supplied name → VolumeId for create_volume idempotency.
+    volume_names: DashMap<String, VolumeId>,
+    node_id: String,
 }
+```
 
-#[async_trait]
-impl CsiController for SlayerFsBackend {
-    async fn create_volume(&self, req: CreateVolumeRequest) -> Result<Volume, CsiError> {
-        let vol_id = VolumeId(format!("slayerfs-{}", uuid::Uuid::new_v4()));
-        let vol_root = self.object_root.join(&vol_id.0);
+磁盘布局：
 
-        // 创建 SlayerFS 客户端实例
-        let client = LocalClient::new_local(vol_root.to_str().unwrap(), self.layout)
-            .await
-            .map_err(|e| CsiError::BackendError(e.to_string()))?;
+```
+<object_root>/
+  <volume-id>/            # SlayerFS 对象存储目录
+  <volume-id>.meta.json   # CSI 元数据文件（用于进程重启后恢复状态）
+```
 
-        // 创建卷的根目录
-        client.mkdir_p("/").await
-            .map_err(|e| CsiError::BackendError(e.to_string()))?;
+#### create_volume（含幂等性与持久化）
 
-        self.volumes.insert(vol_id.clone(), Arc::new(client));
-
-        Ok(Volume {
-            volume_id: vol_id,
-            capacity_bytes: req.capacity_bytes,
-            parameters: req.parameters,
-            volume_context: HashMap::from([
-                ("object_root".into(), vol_root.to_string_lossy().into()),
-            ]),
-            accessible_topology: vec![],
-        })
+```rust
+async fn create_volume(&self, req: CreateVolumeRequest) -> Result<Volume, CsiError> {
+    // Idempotency: return the existing volume if this name was already provisioned.
+    let existing_id = self.volume_names.get(&req.name).map(|r| r.clone());
+    if let Some(id) = existing_id {
+        if let Some(vol) = self.volume_meta.get(&id).map(|r| r.clone()) {
+            return Ok(vol);
+        }
+        // Stale entry: clean up and proceed with fresh allocation.
+        self.volume_names.remove(&req.name);
     }
 
-    async fn delete_volume(&self, volume_id: &VolumeId) -> Result<(), CsiError> {
-        self.volumes.remove(volume_id);
-        let vol_root = self.object_root.join(&volume_id.0);
-        tokio::fs::remove_dir_all(&vol_root).await
-            .map_err(|e| CsiError::BackendError(e.to_string()))?;
-        Ok(())
-    }
+    let vol_id = VolumeId(format!("slayerfs-{}", uuid::Uuid::new_v4()));
+    let client = LocalClient::new_local(&vol_root, self.layout).await?;
+    client.mkdir_p("/").await?;
 
-    // ...
+    // Embed the name in parameters so it survives restarts.
+    let mut parameters = req.parameters;
+    parameters.insert(PARAM_CSI_NAME.to_owned(), req.name.clone());
+
+    // Persist metadata to disk *before* updating in-memory state.
+    // If the write fails, the caller can retry safely.
+    let meta_json = serde_json::to_string_pretty(&volume)?;
+    tokio::fs::write(self.meta_path(&vol_id), meta_json).await?;
+
+    self.volumes.insert(vol_id.clone(), Arc::new(client));
+    self.volume_meta.insert(vol_id.clone(), volume.clone());
+    self.volume_names.insert(req.name, vol_id.clone());
+    Ok(volume)
 }
+```
 
-#[async_trait]
-impl CsiNode for SlayerFsBackend {
-    async fn stage_volume(&self, req: NodeStageVolumeRequest) -> Result<(), CsiError> {
-        let object_root = req.volume_context.get("object_root")
-            .ok_or(CsiError::InvalidArgument("missing object_root".into()))?;
+#### delete_volume（磁盘优先删除）
 
-        // 确保 staging 目录存在
-        tokio::fs::create_dir_all(&req.staging_target_path).await
-            .map_err(|e| CsiError::MountFailed {
-                path: req.staging_target_path.clone(),
-                reason: e.to_string(),
-            })?;
-
-        // 启动 SlayerFS FUSE mount（通过 rfuse3）
-        // 在后台 tokio::spawn 中运行 FUSE session
-        // ...
-
-        Ok(())
+```rust
+async fn delete_volume(&self, volume_id: &VolumeId) -> Result<(), CsiError> {
+    // Delete on-disk data *first*: if removal fails, in-memory state stays
+    // intact and the caller can safely retry.
+    if vol_root.exists() {
+        tokio::fs::remove_dir_all(&vol_root).await?;
+    }
+    if meta_path.exists() {
+        tokio::fs::remove_file(&meta_path).await?;
     }
 
-    async fn unstage_volume(
-        &self,
-        _volume_id: &VolumeId,
-        staging_target_path: &str,
-    ) -> Result<(), CsiError> {
-        // fusermount3 -u <staging_target_path>
-        let status = tokio::process::Command::new("fusermount3")
-            .args(["-u", staging_target_path])
-            .status()
-            .await
-            .map_err(|e| CsiError::UnmountFailed {
-                path: staging_target_path.into(),
-                reason: e.to_string(),
-            })?;
-
-        if !status.success() {
-            return Err(CsiError::UnmountFailed {
-                path: staging_target_path.into(),
-                reason: format!("fusermount3 exit code: {:?}", status.code()),
-            });
+    // Update in-memory state only after disk is clean.
+    self.volumes.remove(volume_id);
+    if let Some((_, vol)) = self.volume_meta.remove(volume_id) {
+        if let Some(name) = vol.parameters.get(PARAM_CSI_NAME) {
+            self.volume_names.remove(name);
         }
-        Ok(())
     }
+    Ok(())
+}
+```
 
-    async fn publish_volume(&self, req: NodePublishVolumeRequest) -> Result<(), CsiError> {
-        tokio::fs::create_dir_all(&req.target_path).await
-            .map_err(|e| CsiError::MountFailed {
-                path: req.target_path.clone(),
-                reason: e.to_string(),
-            })?;
+#### 状态恢复
 
-        // bind-mount: mount --bind <staging_target_path> <target_path>
-        let mut flags = nix::mount::MsFlags::MS_BIND;
-        if req.read_only {
-            flags |= nix::mount::MsFlags::MS_RDONLY;
-        }
-        nix::mount::mount(
-            Some(req.staging_target_path.as_str()),
-            req.target_path.as_str(),
-            None::<&str>,
-            flags,
-            None::<&str>,
-        ).map_err(|e| CsiError::MountFailed {
-            path: req.target_path.clone(),
-            reason: e.to_string(),
-        })?;
+进程重启后，调用 `recover()` 扫描 `object_root` 下的 `.meta.json` 文件重建内存状态：
 
-        Ok(())
-    }
-
-    async fn unpublish_volume(
-        &self,
-        _volume_id: &VolumeId,
-        target_path: &str,
-    ) -> Result<(), CsiError> {
-        nix::mount::umount(target_path)
-            .map_err(|e| CsiError::UnmountFailed {
-                path: target_path.into(),
-                reason: e.to_string(),
-            })?;
-        Ok(())
+```rust
+pub async fn recover(&self) -> Result<(), CsiError> {
+    // Scan object_root for .meta.json sidecars and rebuild volumes/volume_meta/volume_names.
+    // Missing or corrupt entries are skipped with a warning (best-effort).
+    for each .meta.json {
+        let volume: Volume = serde_json::from_str(&json)?;
+        let client = LocalClient::new_local(&vol_root, self.layout).await?;
+        self.volume_names.insert(name, volume.volume_id.clone());
+        self.volumes.insert(volume.volume_id.clone(), Arc::new(client));
+        self.volume_meta.insert(volume.volume_id.clone(), volume);
     }
 }
 ```
+
+#### unstage_volume（卸载后清理目录）
+
+```rust
+async fn unstage_volume(&self, volume_id: &VolumeId, staging_target_path: &str) -> Result<(), CsiError> {
+    // Unmount via fusermount3; non-zero exit is treated as warning (already unmounted).
+    tokio::process::Command::new("fusermount3").args(["-u", staging_target_path]).status().await?;
+
+    // Remove the staging directory so that a subsequent stage_volume call
+    // correctly detects that no mount is active.  Without this, the
+    // directory-existence check in stage_volume would skip the actual mount.
+    tokio::fs::remove_dir(staging).await?;
+    Ok(())
+}
+```
+
+#### publish_volume（基于挂载点检测的幂等性）
+
+```rust
+async fn publish_volume(&self, req: NodePublishVolumeRequest) -> Result<(), CsiError> {
+    // Idempotent: skip the bind-mount if the target is already a mount point.
+    // A plain directory-existence check is insufficient; EBUSY would occur on
+    // the second call without this guard.
+    if is_mountpoint(&req.target_path).await {
+        return Ok(());
+    }
+
+    tokio::fs::create_dir_all(&req.target_path).await?;
+    nix::mount::mount(Some(staging), target, None::<&str>, MS_BIND, None::<&str>)?;
+
+    // Some kernels ignore MS_RDONLY on the initial bind-mount; remount to enforce.
+    if req.read_only {
+        nix::mount::mount(None::<&str>, target, None::<&str>, MS_BIND | MS_REMOUNT | MS_RDONLY, None::<&str>)?;
+    }
+    Ok(())
+}
+```
+
+`is_mountpoint()` 通过读取 `/proc/self/mounts` 检查路径是否已挂载，同时用于 `unpublish_volume` 的幂等性保护（避免对未挂载路径调用 `umount` 时产生 `EINVAL`）。
 
 ---
 
@@ -920,10 +930,10 @@ async fn test_quic_roundtrip() {
 | 阶段 | 内容 | 产出 |
 |------|------|------|
 | **P0 — 骨架** | Cargo.toml + types + traits + CsiMessage + error | 编译通过的空 crate |
-| **P1 — 后端** | SlayerFsBackend 实现 CsiController + CsiNode (本地调用) | 单元/集成测试通过 |
+| **P1 — 后端** | SlayerFsBackend：CsiController + CsiNode + 元数据持久化 + recover() | 单元/集成测试通过 |
 | **P2 — 传输** | QUIC Server/Client + dispatch | 端到端 QUIC 测试通过 |
 | **P3 — 集成** | common PodSpec 扩展 + RKS/RKL 集成调用 | Pod + Volume 完整流程 |
-| **P4 — 加固** | 幂等性、错误恢复、tracing、状态持久化 | 生产可用性 |
+| **P4 — 加固** | FUSE (rfuse3) 真实挂载、stage_volume 切换为 mountpoint 检测、错误恢复 | 生产可用性 |
 
 ---
 
@@ -933,7 +943,7 @@ async fn test_quic_roundtrip() {
 |------|------|
 | SlayerFS FUSE mount 需要 root 或 `allow_other` | Node 服务需适当权限；可使用 `--unprivileged` 模式（rfuse3 已支持） |
 | 多 Pod 共享同一 Volume | Stage 只需执行一次，Publish 可多次 bind-mount |
-| 卷状态持久化（Node 重启后恢复） | 需要在本地 JSON/SQLite 中记录 volume state，启动时 reconcile |
+| 卷状态持久化（Node 重启后恢复） | **已实现**：每个卷写入 `<vol-id>.meta.json`；启动时调用 `recover()` 扫描重建 |
 | QUIC 连接断开重连 | 复用 quinn 的 0-RTT 重连；增加指数退避重试 |
 | 性能基线 | Stage (FUSE mount) 是最慢环节；建议以 criterion bench 衡量 |
 

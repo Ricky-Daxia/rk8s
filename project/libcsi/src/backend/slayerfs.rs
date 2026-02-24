@@ -5,6 +5,14 @@
 //! engine.  Volumes are stored as sub-directories under a configurable
 //! `object_root`, and made available to containers via FUSE staging and
 //! bind-mount publishing.
+//!
+//! # On-disk layout
+//!
+//! ```text
+//! <object_root>/
+//!   <volume-id>/            # SlayerFS object store for each volume
+//!   <volume-id>.meta.json   # Persisted CSI metadata (used for recovery)
+//! ```
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,14 +30,12 @@ use crate::identity::CsiIdentity;
 use crate::node::CsiNode;
 use crate::types::*;
 
+/// Key stored in [`Volume::parameters`] to persist the caller-supplied volume
+/// name across process restarts, enabling `create_volume` idempotency after
+/// recovery.
+const PARAM_CSI_NAME: &str = "_csi_name";
+
 /// Concrete CSI backend backed by SlayerFS.
-///
-/// # Layout
-///
-/// ```text
-/// <object_root>/
-///   <volume-id>/          # SlayerFS object store for each volume
-/// ```
 ///
 /// # Thread safety
 ///
@@ -40,16 +46,23 @@ pub struct SlayerFsBackend {
     object_root: PathBuf,
     /// Chunk layout configuration forwarded to each `LocalClient`.
     layout: ChunkLayout,
-    /// Tracks live SlayerFS clients keyed by volume ID.
+    /// Live SlayerFS clients, keyed by volume ID.
     volumes: DashMap<VolumeId, Arc<dyn ClientBackend>>,
-    /// Tracks volume metadata keyed by volume ID.
+    /// Volume metadata, keyed by volume ID.
     volume_meta: DashMap<VolumeId, Volume>,
-    /// Node identifier (hostname or user-supplied).
+    /// Maps the caller-supplied volume name to the assigned [`VolumeId`].
+    /// Used to enforce idempotency in `create_volume`: repeated calls with
+    /// the same name return the existing volume instead of creating a new one.
+    volume_names: DashMap<String, VolumeId>,
+    /// Node identifier (hostname or user-supplied string).
     node_id: String,
 }
 
 impl SlayerFsBackend {
     /// Create a new backend.
+    ///
+    /// Call [`Self::recover`] afterwards to restore state from a previous
+    /// process run.
     ///
     /// * `object_root` — base directory on the local filesystem
     /// * `layout` — SlayerFS chunk layout
@@ -60,14 +73,122 @@ impl SlayerFsBackend {
             layout,
             volumes: DashMap::new(),
             volume_meta: DashMap::new(),
+            volume_names: DashMap::new(),
             node_id,
         }
     }
 
-    /// Resolve the on-disk object root for a given volume.
+    /// Resolve the on-disk object store directory for a given volume.
     fn volume_root(&self, volume_id: &VolumeId) -> PathBuf {
         self.object_root.join(&volume_id.0)
     }
+
+    /// Resolve the path to the persisted metadata sidecar for a volume.
+    fn meta_path(&self, volume_id: &VolumeId) -> PathBuf {
+        self.object_root.join(format!("{}.meta.json", volume_id.0))
+    }
+
+    /// Scan `object_root` for persisted volume metadata and rebuild the
+    /// in-memory state maps.
+    ///
+    /// This is a best-effort operation: volumes whose directories or metadata
+    /// files are missing are skipped with a warning rather than treated as
+    /// hard errors.  Call this once after construction to restore state across
+    /// process restarts.
+    pub async fn recover(&self) -> Result<(), CsiError> {
+        let mut dir = match tokio::fs::read_dir(&self.object_root).await {
+            Ok(d) => d,
+            // Nothing to recover if the root does not exist yet.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(CsiError::BackendError(format!(
+                    "read_dir {}: {e}",
+                    self.object_root.display()
+                )));
+            }
+        };
+
+        while let Some(entry) = dir.next_entry().await.map_err(CsiError::backend)? {
+            let path = entry.path();
+
+            // Only process `.meta.json` sidecar files.
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !file_name.ends_with(".meta.json") {
+                continue;
+            }
+
+            let json = match tokio::fs::read_to_string(&path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to read volume metadata, skipping");
+                    continue;
+                }
+            };
+
+            let volume: Volume = match serde_json::from_str(&json) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to parse volume metadata, skipping");
+                    continue;
+                }
+            };
+
+            let vol_root = self.volume_root(&volume.volume_id);
+            if !vol_root.exists() {
+                warn!(volume_id = %volume.volume_id, "volume directory missing, skipping recovery");
+                continue;
+            }
+
+            match LocalClient::new_local(&vol_root, self.layout).await {
+                Ok(client) => {
+                    if let Some(name) = volume.parameters.get(PARAM_CSI_NAME) {
+                        self.volume_names
+                            .insert(name.clone(), volume.volume_id.clone());
+                    }
+                    self.volumes
+                        .insert(volume.volume_id.clone(), Arc::new(client));
+                    self.volume_meta.insert(volume.volume_id.clone(), volume);
+                }
+                Err(e) => {
+                    warn!(volume_id = %volume.volume_id, error = %e,
+                        "failed to re-open SlayerFS client, skipping");
+                }
+            }
+        }
+
+        info!(
+            object_root = %self.object_root.display(),
+            count = self.volume_meta.len(),
+            "recovery complete",
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mount point detection
+// ---------------------------------------------------------------------------
+
+/// Return `true` if `path` is currently listed as a mount point in
+/// `/proc/self/mounts`.
+///
+/// Used by [`publish_volume`] and [`unpublish_volume`] to implement
+/// idempotency without relying solely on directory-existence checks.
+///
+/// Note: `/proc/self/mounts` uses octal escapes (`\040` for space, etc.).
+/// CSI target paths must not contain whitespace, so direct string comparison
+/// is safe here.
+async fn is_mountpoint(path: &str) -> bool {
+    let contents = match tokio::fs::read_to_string("/proc/self/mounts").await {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    // Format: <device> <mountpoint> <fstype> <options> <dump> <pass>
+    contents
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(path))
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +205,7 @@ impl CsiIdentity for SlayerFsBackend {
     }
 
     async fn probe(&self) -> Result<bool, CsiError> {
-        // Check that the object root exists and is a directory.
+        // The backend is healthy when its object root exists and is a directory.
         let exists = tokio::fs::metadata(&self.object_root)
             .await
             .map(|m| m.is_dir())
@@ -105,26 +226,41 @@ impl CsiIdentity for SlayerFsBackend {
 impl CsiController for SlayerFsBackend {
     #[instrument(skip(self), fields(name = %req.name))]
     async fn create_volume(&self, req: CreateVolumeRequest) -> Result<Volume, CsiError> {
+        // Idempotency: if a volume with this name was already provisioned,
+        // return it rather than allocating a new one.
+        let existing_id = self.volume_names.get(&req.name).map(|r| r.clone());
+        if let Some(id) = existing_id {
+            if let Some(vol) = self.volume_meta.get(&id).map(|r| r.clone()) {
+                debug!(name = %req.name, %id, "returning existing volume for idempotent create");
+                return Ok(vol);
+            }
+            // Stale entry: name is recorded but metadata is gone.
+            // Clean up so the code below can proceed with a fresh allocation.
+            self.volume_names.remove(&req.name);
+        }
+
         let vol_id = VolumeId(format!("slayerfs-{}", uuid::Uuid::new_v4()));
         let vol_root = self.volume_root(&vol_id);
 
-        // Ensure the volume root directory exists on the host filesystem.
         tokio::fs::create_dir_all(&vol_root).await.map_err(|e| {
             CsiError::BackendError(format!("create dir {}: {e}", vol_root.display()))
         })?;
 
-        // Construct a SlayerFS LocalClient for this volume.
         let client = LocalClient::new_local(&vol_root, self.layout)
             .await
             .map_err(CsiError::backend)?;
 
-        // Bootstrap the volume's internal root directory.
         client.mkdir_p("/").await.map_err(CsiError::backend)?;
+
+        // Embed the caller-supplied name in parameters so it survives restarts
+        // and can be used to rebuild `volume_names` during recovery.
+        let mut parameters = req.parameters;
+        parameters.insert(PARAM_CSI_NAME.to_owned(), req.name.clone());
 
         let volume = Volume {
             volume_id: vol_id.clone(),
             capacity_bytes: req.capacity_bytes,
-            parameters: req.parameters,
+            parameters,
             volume_context: HashMap::from([(
                 "object_root".to_owned(),
                 vol_root.to_string_lossy().into_owned(),
@@ -134,23 +270,46 @@ impl CsiController for SlayerFsBackend {
             }],
         };
 
+        // Persist metadata to disk *before* updating in-memory state.
+        // If the write fails the caller can safely retry: no volume ID has
+        // been committed yet.
+        let meta_json = serde_json::to_string_pretty(&volume).map_err(CsiError::backend)?;
+        tokio::fs::write(self.meta_path(&vol_id), meta_json)
+            .await
+            .map_err(|e| CsiError::BackendError(format!("write meta {vol_id}: {e}")))?;
+
         self.volumes.insert(vol_id.clone(), Arc::new(client));
         self.volume_meta.insert(vol_id.clone(), volume.clone());
-        info!(%vol_id, "volume created");
+        self.volume_names.insert(req.name, vol_id.clone());
 
+        info!(%vol_id, "volume created");
         Ok(volume)
     }
 
     #[instrument(skip(self))]
     async fn delete_volume(&self, volume_id: &VolumeId) -> Result<(), CsiError> {
-        self.volumes.remove(volume_id);
-        self.volume_meta.remove(volume_id);
-
+        // Delete on-disk data *first* so that if removal fails the in-memory
+        // state is still intact and the caller can safely retry.
         let vol_root = self.volume_root(volume_id);
         if vol_root.exists() {
             tokio::fs::remove_dir_all(&vol_root).await.map_err(|e| {
                 CsiError::BackendError(format!("remove dir {}: {e}", vol_root.display()))
             })?;
+        }
+
+        let meta_path = self.meta_path(volume_id);
+        if meta_path.exists() {
+            tokio::fs::remove_file(&meta_path).await.map_err(|e| {
+                CsiError::BackendError(format!("remove meta {}: {e}", meta_path.display()))
+            })?;
+        }
+
+        // Update in-memory state only after the disk is clean.
+        self.volumes.remove(volume_id);
+        if let Some((_, vol)) = self.volume_meta.remove(volume_id)
+            && let Some(name) = vol.parameters.get(PARAM_CSI_NAME)
+        {
+            self.volume_names.remove(name);
         }
 
         info!(%volume_id, "volume deleted");
@@ -170,7 +329,7 @@ impl CsiController for SlayerFsBackend {
     }
 
     async fn list_volumes(&self) -> Result<Vec<Volume>, CsiError> {
-        let vols: Vec<Volume> = self
+        let vols = self
             .volume_meta
             .iter()
             .map(|entry| entry.value().clone())
@@ -179,7 +338,6 @@ impl CsiController for SlayerFsBackend {
     }
 
     async fn get_capacity(&self) -> Result<u64, CsiError> {
-        // Report available disk space on the partition hosting `object_root`.
         let stat = nix::sys::statvfs::statvfs(
             self.object_root
                 .to_str()
@@ -200,8 +358,15 @@ impl CsiNode for SlayerFsBackend {
     async fn stage_volume(&self, req: NodeStageVolumeRequest) -> Result<(), CsiError> {
         let staging = Path::new(&req.staging_target_path);
 
-        // Idempotent: if the directory already exists and is a mount point,
-        // assume a previous stage succeeded.
+        // Idempotent: treat an existing staging directory as evidence that a
+        // prior stage succeeded.  This invariant is maintained by
+        // `unstage_volume`, which always removes the directory on unmount so
+        // that a leftover directory unambiguously means the volume is staged.
+        //
+        // TODO: Once FUSE (rfuse3) integration lands, replace this
+        // directory-existence check with `is_mountpoint()` to correctly handle
+        // the case where the directory was created but the mount was not
+        // completed.
         if staging.exists() {
             debug!(path = %req.staging_target_path, "staging path already exists, assuming idempotent retry");
             return Ok(());
@@ -214,15 +379,11 @@ impl CsiNode for SlayerFsBackend {
                 reason: e.to_string(),
             })?;
 
-        // NOTE: The actual FUSE mount of SlayerFS at the staging path would
-        // be done here via rfuse3.  This requires spawning a background task
-        // that runs the FUSE session.  A full implementation would look like:
+        // NOTE: The actual FUSE mount of SlayerFS at the staging path will be
+        // done here via rfuse3 once that integration is implemented (P2):
         //
         //   let vfs = build_slayerfs_vfs(&req.volume_context)?;
         //   tokio::spawn(rfuse3::mount(vfs, staging, mount_options));
-        //
-        // For now we leave a placeholder; the FUSE integration is deferred
-        // to the P1/P2 implementation phase.
 
         info!(path = %req.staging_target_path, "volume staged (FUSE mount placeholder)");
         Ok(())
@@ -240,7 +401,7 @@ impl CsiNode for SlayerFsBackend {
             return Ok(());
         }
 
-        // Attempt to unmount via fusermount3 (FUSE userspace unmount).
+        // Unmount the FUSE filesystem.
         let status = tokio::process::Command::new("fusermount3")
             .args(["-u", staging_target_path])
             .status()
@@ -251,8 +412,7 @@ impl CsiNode for SlayerFsBackend {
             })?;
 
         if !status.success() {
-            // Non-zero exit may mean it was already unmounted; log a warning
-            // but treat as ok (idempotent).
+            // A non-zero exit typically means the path was already unmounted.
             warn!(
                 %volume_id,
                 path = staging_target_path,
@@ -261,15 +421,31 @@ impl CsiNode for SlayerFsBackend {
             );
         }
 
+        // Remove the staging directory so that a subsequent `stage_volume`
+        // call correctly detects that no mount is active.  If this directory
+        // were left behind, `stage_volume`'s existence check would
+        // incorrectly skip the mount entirely.
+        tokio::fs::remove_dir(staging)
+            .await
+            .map_err(|e| CsiError::UnmountFailed {
+                path: staging_target_path.to_owned(),
+                reason: format!("remove staging dir: {e}"),
+            })?;
+
         info!(%volume_id, path = staging_target_path, "volume unstaged");
         Ok(())
     }
 
     #[instrument(skip(self), fields(volume_id = %req.volume_id))]
     async fn publish_volume(&self, req: NodePublishVolumeRequest) -> Result<(), CsiError> {
-        let target = Path::new(&req.target_path);
+        // Idempotent: skip the bind-mount if the target is already a mount
+        // point.  Without this check a second call would fail with EBUSY.
+        if is_mountpoint(&req.target_path).await {
+            debug!(target_path = %req.target_path, "target already mounted, assuming idempotent retry");
+            return Ok(());
+        }
 
-        tokio::fs::create_dir_all(target)
+        tokio::fs::create_dir_all(Path::new(&req.target_path))
             .await
             .map_err(|e| CsiError::MountFailed {
                 path: req.target_path.clone(),
@@ -293,8 +469,8 @@ impl CsiNode for SlayerFsBackend {
             reason: e.to_string(),
         })?;
 
-        // If read-only was requested, remount with MS_RDONLY (bind mount
-        // ignores MS_RDONLY on the first call on some kernels).
+        // Some kernels ignore MS_RDONLY on the initial bind-mount call; a
+        // separate remount is required to actually enforce read-only access.
         if req.read_only {
             nix::mount::mount(
                 None::<&str>,
@@ -325,9 +501,11 @@ impl CsiNode for SlayerFsBackend {
         volume_id: &VolumeId,
         target_path: &str,
     ) -> Result<(), CsiError> {
-        let target = Path::new(target_path);
-        if !target.exists() {
-            debug!(%volume_id, "target path gone, nothing to unpublish");
+        // Idempotent: skip umount if the target is not currently a mount point.
+        // Using a mountpoint check rather than directory existence avoids
+        // spurious EINVAL errors on repeated calls.
+        if !is_mountpoint(target_path).await {
+            debug!(%volume_id, "target not mounted, nothing to unpublish");
             return Ok(());
         }
 
@@ -376,6 +554,10 @@ mod tests {
         assert!(vol.volume_id.0.starts_with("slayerfs-"));
         assert!(backend.volume_meta.contains_key(&vol.volume_id));
         assert!(backend.volumes.contains_key(&vol.volume_id));
+        assert!(backend.volume_names.contains_key("test-vol"));
+
+        // The metadata sidecar file must be written to disk.
+        assert!(backend.meta_path(&vol.volume_id).exists());
 
         // List should include the volume.
         let list = backend.list_volumes().await.unwrap();
@@ -384,9 +566,68 @@ mod tests {
         // Delete.
         backend.delete_volume(&vol.volume_id).await.unwrap();
         assert!(!backend.volume_meta.contains_key(&vol.volume_id));
+        assert!(!backend.volume_names.contains_key("test-vol"));
+        assert!(!backend.meta_path(&vol.volume_id).exists());
 
         let list = backend.list_volumes().await.unwrap();
         assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_volume_idempotent_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = make_backend(tmp.path());
+
+        let vol1 = backend
+            .create_volume(CreateVolumeRequest {
+                name: "my-vol".into(),
+                capacity_bytes: 1024,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Second call with the same name must return the same volume.
+        let vol2 = backend
+            .create_volume(CreateVolumeRequest {
+                name: "my-vol".into(),
+                capacity_bytes: 1024,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(vol1.volume_id, vol2.volume_id);
+        assert_eq!(backend.list_volumes().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recover_restores_state() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a volume in the first backend instance.
+        let vol_id = {
+            let backend = make_backend(tmp.path());
+            let vol = backend
+                .create_volume(CreateVolumeRequest {
+                    name: "persistent-vol".into(),
+                    capacity_bytes: 1024,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            vol.volume_id
+        };
+
+        // A fresh backend instance must recover the volume via recover().
+        let backend2 = make_backend(tmp.path());
+        assert!(!backend2.volume_meta.contains_key(&vol_id));
+
+        backend2.recover().await.unwrap();
+
+        assert!(backend2.volume_meta.contains_key(&vol_id));
+        assert!(backend2.volume_names.contains_key("persistent-vol"));
+        assert_eq!(backend2.list_volumes().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

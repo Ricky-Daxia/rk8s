@@ -18,10 +18,15 @@ pub struct CsiClient {
 impl CsiClient {
     /// Establish a new QUIC connection to the CSI server at `addr`.
     ///
-    /// `tls_config` must be a valid [`rustls::ClientConfig`] — typically
-    /// built from certificates issued by `libvault`.
+    /// * `addr` — socket address of the remote CSI server
+    /// * `server_name` — TLS SNI name that must match a SAN in the server's
+    ///   certificate (typically the hostname or a fixed name agreed upon when
+    ///   certificates are issued by `libvault`)
+    /// * `tls_config` — client TLS configuration, typically built from
+    ///   certificates issued by `libvault`
     pub async fn connect(
         addr: SocketAddr,
+        server_name: &str,
         tls_config: rustls::ClientConfig,
     ) -> Result<Self, CsiError> {
         let quic_client_config = QuicClientConfig::try_from(tls_config)
@@ -33,12 +38,12 @@ impl CsiClient {
         endpoint.set_default_client_config(client_config);
 
         let connection = endpoint
-            .connect(addr, "libcsi")
+            .connect(addr, server_name)
             .map_err(CsiError::transport)?
             .await
             .map_err(CsiError::transport)?;
 
-        debug!(%addr, "CSI QUIC connection established");
+        debug!(%addr, %server_name, "CSI QUIC connection established");
         Ok(Self { connection })
     }
 
