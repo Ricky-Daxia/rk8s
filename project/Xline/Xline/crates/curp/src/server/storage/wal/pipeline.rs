@@ -34,7 +34,6 @@ pub(super) struct FilePipeline {
     stopped: Arc<AtomicBool>,
     /// Join handle of the allocation task
     file_alloc_task_handle: Option<JoinHandle<()>>,
-
 }
 
 impl FilePipeline {
@@ -48,7 +47,7 @@ impl FilePipeline {
         let stopped = Arc::new(AtomicBool::new(false));
         let stopped_c = Arc::clone(&stopped);
 
-{
+        {
             let (file_tx, file_rx) = flume::bounded(1);
             let file_alloc_task_handle = std::thread::spawn(move || {
                 let mut file_count = 0;
@@ -103,9 +102,10 @@ impl FilePipeline {
         for result in std::fs::read_dir(dir)? {
             let file = result?;
             if let Some(filename) = file.file_name().to_str()
-                && filename.ends_with(TEMP_FILE_EXT) {
-                    std::fs::remove_file(file.path())?;
-                }
+                && filename.ends_with(TEMP_FILE_EXT)
+            {
+                std::fs::remove_file(file.path())?;
+            }
         }
         Ok(())
     }

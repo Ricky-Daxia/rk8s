@@ -34,6 +34,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::Status;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, ServerTlsConfig};
 use tracing::debug;
 use utils::{
@@ -43,6 +44,9 @@ use utils::{
     },
     task_manager::{Listener, TaskManager, tasks::TaskName},
 };
+// TODO: use our own status type
+// use xlinerpc::status::Status;
+
 pub mod commandpb {
     tonic::include_proto!("commandpb");
 }
@@ -174,8 +178,9 @@ impl CurpGroup {
 
     async fn gen_listeners(keys: impl Iterator<Item = &String>) -> HashMap<String, TcpListener> {
         join_all(
-            keys
-                .map(|name| async { (name.clone(), TcpListener::bind("0.0.0.0:0").await.unwrap()) }),
+            keys.map(|name| async {
+                (name.clone(), TcpListener::bind("0.0.0.0:0").await.unwrap())
+            }),
         )
         .await
         .into_iter()
@@ -315,9 +320,7 @@ impl CurpGroup {
         self.nodes.get_mut(id).unwrap()
     }
 
-    pub async fn new_client(
-        &self,
-    ) -> impl ClientApi<Error = tonic::Status, Cmd = TestCommand> + use<> {
+    pub async fn new_client(&self) -> impl ClientApi<Error = Status, Cmd = TestCommand> + use<> {
         let addrs = self.all_addrs().cloned().collect();
         ClientBuilder::new(ClientConfig::default(), true)
             .discover_from(addrs)

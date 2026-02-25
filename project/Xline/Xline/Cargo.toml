@@ -5,6 +5,7 @@ members = [
     "crates/curp-external-api",
     "crates/curp-test-utils",
     "crates/engine",
+    "crates/xlinerpc",
     "crates/test-macros",
     "crates/utils",
     "crates/xline",

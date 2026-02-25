@@ -610,8 +610,7 @@ impl RocksSnapshot {
             }
             let meta_data = buf.split_to(meta_len.numeric_cast::<usize>().overflow_add(8));
             #[allow(clippy::indexing_slicing)]
-            let meta = bincode::deserialize(&meta_data[8..])
-                .map_err(io::Error::other)?;
+            let meta = bincode::deserialize(&meta_data[8..]).map_err(io::Error::other)?;
 
             self.apply_snap_meta(meta);
             *self.meta.data.get_mut() = meta_data;
@@ -624,9 +623,10 @@ impl RocksSnapshot {
         while self.snap_file_idx < self.snap_files.len() {
             let snap_file = &mut self.snap_files[self.snap_file_idx];
             if snap_file.size == 0 {
-                return Err(io::Error::other(
-                    format!("snap file {} size is 0", snap_file.filename),
-                ));
+                return Err(io::Error::other(format!(
+                    "snap file {} size is 0",
+                    snap_file.filename
+                )));
             }
             let left = snap_file.remain_size().numeric_cast();
             let (write_len, switch, finished) = match buf.len().cmp(&left) {

@@ -8,8 +8,8 @@ use std::{marker::PhantomData, sync::Arc, task::Poll};
 use futures::{Stream, future::BoxFuture};
 use gm_quic::prelude::{Connection, QuicListeners};
 use prost::Message;
-use tokio::task::JoinHandle;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, error};
 
 use crate::{
@@ -80,9 +80,12 @@ where
                     let svc = Arc::clone(&service);
                     let inner_svc = Arc::clone(&inner_service);
 
-                    let _handle = tokio::spawn(async move {
-                        Self::handle_connection(conn, svc, inner_svc).await;
-                    }.instrument(tracing::debug_span!("quic_conn")));
+                    let _handle = tokio::spawn(
+                        async move {
+                            Self::handle_connection(conn, svc, inner_svc).await;
+                        }
+                        .instrument(tracing::debug_span!("quic_conn")),
+                    );
                 }
                 Err(e) => {
                     error!("Listeners shutdown: {e}");
@@ -120,11 +123,14 @@ where
                     let svc = Arc::clone(&service);
                     let inner_svc = Arc::clone(&inner_service);
 
-                    let _handle = tokio::spawn(async move {
-                        if let Err(e) = Self::handle_stream(send, recv, svc, inner_svc).await {
-                            debug!("stream handler error: {e:?}");
+                    let _handle = tokio::spawn(
+                        async move {
+                            if let Err(e) = Self::handle_stream(send, recv, svc, inner_svc).await {
+                                debug!("stream handler error: {e:?}");
+                            }
                         }
-                    }.instrument(tracing::debug_span!("quic_stream")));
+                        .instrument(tracing::debug_span!("quic_stream")),
+                    );
                 }
                 Err(e) => {
                     debug!("accept stream error: {e}");
@@ -153,9 +159,7 @@ where
             Some(m) => m,
             None => {
                 let mut writer = FrameWriter::new(send);
-                let err = CurpError::internal(format!(
-                    "unknown method id: 0x{method_raw:04X}"
-                ));
+                let err = CurpError::internal(format!("unknown method id: 0x{method_raw:04X}"));
                 let wrapper = CurpErrorWrapper { err: Some(err) };
                 writer
                     .write_frame(&Frame::Status {
@@ -197,8 +201,7 @@ where
             | MethodId::Vote
             | MethodId::TriggerShutdown
             | MethodId::TryBecomeLeaderNow => {
-                let result =
-                    Self::dispatch(method, recv, &meta, &service, &inner_service).await;
+                let result = Self::dispatch(method, recv, &meta, &service, &inner_service).await;
 
                 // Write response
                 let mut writer = FrameWriter::new(send);
@@ -243,31 +246,19 @@ where
         R: AsyncRead + Unpin + Send + 'static,
     {
         match method {
-            MethodId::FetchCluster => {
-                Self::handle_fetch_cluster(recv, service).await
-            }
-            MethodId::FetchReadState => {
-                Self::handle_fetch_read_state(recv, service).await
-            }
+            MethodId::FetchCluster => Self::handle_fetch_cluster(recv, service).await,
+            MethodId::FetchReadState => Self::handle_fetch_read_state(recv, service).await,
             MethodId::Record => Self::handle_record(recv, meta, service).await,
             MethodId::ReadIndex => Self::handle_read_index(recv, meta, service).await,
-            MethodId::Shutdown => {
-                Self::handle_shutdown(recv, meta, service).await
-            }
+            MethodId::Shutdown => Self::handle_shutdown(recv, meta, service).await,
             MethodId::ProposeConfChange => {
                 Self::handle_propose_conf_change(recv, meta, service).await
             }
             MethodId::Publish => Self::handle_publish(recv, meta, service).await,
             MethodId::MoveLeader => Self::handle_move_leader(recv, service).await,
-            MethodId::AppendEntries => {
-                Self::handle_append_entries(recv, inner_service).await
-            }
-            MethodId::Vote => {
-                Self::handle_vote(recv, inner_service).await
-            }
-            MethodId::TriggerShutdown => {
-                Self::handle_trigger_shutdown(recv, inner_service).await
-            }
+            MethodId::AppendEntries => Self::handle_append_entries(recv, inner_service).await,
+            MethodId::Vote => Self::handle_vote(recv, inner_service).await,
+            MethodId::TriggerShutdown => Self::handle_trigger_shutdown(recv, inner_service).await,
             MethodId::TryBecomeLeaderNow => {
                 Self::handle_try_become_leader_now(recv, inner_service).await
             }
@@ -361,8 +352,7 @@ where
         // Consume the request frames (DATA+END) even though the message is empty.
         // This ensures the QUIC stream is properly closed and avoids connection
         // reset noise from unconsumed frames.
-        let _req: crate::rpc::proto::commandpb::ReadIndexRequest =
-            Self::read_request(recv).await?;
+        let _req: crate::rpc::proto::commandpb::ReadIndexRequest = Self::read_request(recv).await?;
         let resp = service.read_index(meta.clone())?;
         Ok(resp.encode_to_vec())
     }
@@ -618,8 +608,7 @@ where
         use crate::rpc::InstallSnapshotRequest;
 
         // Build a stream from the client's DATA frames
-        let request_stream =
-            Self::client_streaming_to_stream::<R, InstallSnapshotRequest>(recv);
+        let request_stream = Self::client_streaming_to_stream::<R, InstallSnapshotRequest>(recv);
 
         let mut writer = FrameWriter::new(send);
 

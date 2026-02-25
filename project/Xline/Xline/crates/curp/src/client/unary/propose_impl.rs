@@ -10,7 +10,9 @@ use crate::{
     rpc::{CurpError, OpResponse, ProposeId, ProposeRequest, RecordRequest, ResponseOp},
     super_quorum,
 };
-
+// use tonic::Status;
+// TODO: use our own status type
+// use xlinerpc::status::Status;
 use super::Unary;
 
 /// A stream of propose events
@@ -231,17 +233,12 @@ impl<C: Command> Unary<C> {
     ///
     /// It is considered a propose failure when the stream returns a `CurpError`
     fn flatten_propose_stream_result(
-        result: Result<
-            Box<dyn Stream<Item = Result<OpResponse, CurpError>> + Send>,
-            CurpError,
-        >,
+        result: Result<Box<dyn Stream<Item = Result<OpResponse, CurpError>> + Send>, CurpError>,
     ) -> EventStream<'static, C> {
         match result {
             Ok(stream) => {
                 let pinned_stream = Box::into_pin(stream);
-                Box::new(
-                    pinned_stream.map(|r| r.map(ProposeEvent::<C>::from)),
-                )
+                Box::new(pinned_stream.map(|r| r.map(ProposeEvent::<C>::from)))
             }
             Err(e) => Box::new(future::ready(Err(e)).into_stream()),
         }

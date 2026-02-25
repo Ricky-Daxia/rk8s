@@ -6,6 +6,9 @@ use std::{
 use async_trait::async_trait;
 use event_listener::Event;
 use futures::Stream;
+// use tonic::Status;
+// TODO: use our own status type
+// use xlinerpc::status::Status;
 
 use crate::{
     members::ServerId,
@@ -54,7 +57,7 @@ impl<C: ConnectApi> Reconnect<C> {
 
     /// Try to reconnect if the result is `Err`
     async fn try_reconnect<R>(&self, result: Result<R, CurpError>) -> Result<R, CurpError> {
-        // TODO: use `tonic::Status` instead of `CurpError`, we can't tell
+        // TODO: use `Status` instead of `CurpError`, we can't tell
         // if a reconnect is required from `CurpError`.
         if matches!(
             result,
@@ -113,10 +116,7 @@ impl<C: ConnectApi> ConnectApi for Reconnect<C> {
     }
 
     /// Send `ReadIndexRequest`
-    async fn read_index(
-        &self,
-        timeout: Duration,
-    ) -> Result<ReadIndexResponse, CurpError> {
+    async fn read_index(&self, timeout: Duration) -> Result<ReadIndexResponse, CurpError> {
         execute_with_reconnect!(self, ConnectApi::read_index, timeout)
     }
 

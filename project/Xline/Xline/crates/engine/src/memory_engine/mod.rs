@@ -46,8 +46,6 @@ impl MemoryEngine {
         }
     }
 
-
-
     /// Write an operation
     #[inline]
     fn write_op(

@@ -1189,11 +1189,7 @@ impl<C: Command, RC: RoleChange> RawCurp<C, RC> {
         if st_r.role != Role::Leader {
             return Err(CurpError::redirect(st_r.leader_id, st_r.term));
         }
-        if self
-            .cluster()
-            .get(&target_id)
-            .is_none_or(|m| m.is_learner)
-        {
+        if self.cluster().get(&target_id).is_none_or(|m| m.is_learner) {
             return Err(CurpError::LeaderTransfer(
                 "target node does not exist or it is a learner".to_owned(),
             ));
@@ -1939,7 +1935,13 @@ impl<C: Command, RC: RoleChange> RawCurp<C, RC> {
         let (modified, fallback_info) = match conf_change.change_type() {
             ConfChangeType::Add | ConfChangeType::AddLearner => {
                 let is_learner = matches!(conf_change.change_type(), ConfChangeType::AddLearner);
-                let member = Member::new(node_id, String::new(), conf_change.address.clone(), Vec::new(), is_learner);
+                let member = Member::new(
+                    node_id,
+                    String::new(),
+                    conf_change.address.clone(),
+                    Vec::new(),
+                    is_learner,
+                );
                 _ = cst_l.config.insert(node_id, is_learner);
                 self.lst.insert(node_id, is_learner);
                 _ = self.ctx.sync_events.insert(node_id, Arc::new(Event::new()));
@@ -2013,9 +2015,11 @@ impl<C: Command, RC: RoleChange> RawCurp<C, RC> {
     fn notify_sync_events(&self, log: &Log<C>) {
         self.ctx.sync_events.iter().for_each(|e| {
             if let Some(next) = self.lst.get_next_index(*e.key())
-                && next > log.base_index && log.has_next_batch(next) {
-                    let _ignore = e.notify(1);
-                }
+                && next > log.base_index
+                && log.has_next_batch(next)
+            {
+                let _ignore = e.notify(1);
+            }
         });
     }
 

@@ -4,9 +4,6 @@ use tokio::fs;
 
 use anyhow::{Result, anyhow};
 use clippy_utilities::{NumericCast, OverflowArithmetic};
-use futures::Stream;
-use jsonwebtoken::{DecodingKey, EncodingKey};
-use tokio::io::{AsyncRead, AsyncWrite};
 use curp::{
     client::ClientBuilder as CurpClientBuilder,
     members::{ClusterInfo, get_cluster_info_from_remote},
@@ -15,9 +12,16 @@ use curp::{
 };
 use dashmap::DashMap;
 use engine::{MemorySnapshotAllocator, RocksSnapshotAllocator, SnapshotAllocator};
-use tonic::transport::{Certificate, ClientTlsConfig, Identity, Server, ServerTlsConfig};
+use futures::Stream;
+use jsonwebtoken::{DecodingKey, EncodingKey};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tonic::transport::server::{Connected, Router};
+use tonic::transport::{Certificate, ClientTlsConfig, Identity, Server, ServerTlsConfig};
 use tracing::{info, warn};
+
+use tonic::Status;
+// TODO: use our own status type
+// use xlinerpc::status::Status;
 
 use utils::{
     barrier::IdBarrier,
@@ -297,7 +301,6 @@ impl XlineServer {
         ) = self.init_servers(db, key_pair).await?;
         let mut builder = Server::builder();
 
-
         if let Some(ref cfg) = self.server_tls_config {
             builder = builder.tls_config(cfg.clone())?;
         }
@@ -447,20 +450,19 @@ impl XlineServer {
             _ => unimplemented!(),
         };
 
-        let auto_compactor =
-            if let Some(auto_config_cfg) = *self.compact_config.auto_compactor() {
-                Some(
-                    auto_compactor(
-                        *self.cluster_config.is_leader(),
-                        header_gen.general_revision_arc(),
-                        auto_config_cfg,
-                        Arc::clone(&self.task_manager),
-                    )
-                    .await,
+        let auto_compactor = if let Some(auto_config_cfg) = *self.compact_config.auto_compactor() {
+            Some(
+                auto_compactor(
+                    *self.cluster_config.is_leader(),
+                    header_gen.general_revision_arc(),
+                    auto_config_cfg,
+                    Arc::clone(&self.task_manager),
                 )
-            } else {
-                None
-            };
+                .await,
+            )
+        } else {
+            None
+        };
 
         let auto_compactor_c = auto_compactor.clone();
 
@@ -553,7 +555,7 @@ impl XlineServer {
     }
 
     /// Publish the name of current node to cluster
-    async fn publish(&self, curp_client: Arc<CurpClient>) -> Result<(), tonic::Status> {
+    async fn publish(&self, curp_client: Arc<CurpClient>) -> Result<(), Status> {
         curp_client
             .propose_publish(
                 self.cluster_info.self_id(),

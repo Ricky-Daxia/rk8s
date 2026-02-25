@@ -4,12 +4,12 @@
 //! It implements the same `ConnectApi`/`InnerConnectApi` traits but uses
 //! gm-quic streams with prost encoding instead of tonic channels.
 
-pub(crate) mod codec;
 pub(crate) mod channel;
+pub(crate) mod codec;
 pub(crate) mod server;
 
-pub use channel::QuicChannel;
 pub use channel::DnsFallback;
+pub use channel::QuicChannel;
 pub use codec::MethodId;
 pub use server::QuicGrpcServer;
 

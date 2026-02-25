@@ -294,12 +294,7 @@ impl From<ServerArgs> for XlineServerConfig {
             initial_cluster_state,
         );
         let log = LogConfig::new(args.log_file, args.log_rotate, args.log_level);
-        let trace = TraceConfig::new(
-            args.online,
-            args.offline,
-            args.output_dir,
-            args.level,
-        );
+        let trace = TraceConfig::new(args.online, args.offline, args.output_dir, args.level);
         let auth = AuthConfig::new(args.auth_public_key, args.auth_private_key);
         let auto_compactor_cfg = if let Some(mode) = args.auto_compact_mode {
             match mode.as_str() {

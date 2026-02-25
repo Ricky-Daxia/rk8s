@@ -16,10 +16,13 @@ use futures::StreamExt;
 #[cfg(test)]
 use mockall::automock;
 use tokio::sync::Mutex;
+use tonic::Status;
 use tonic::transport::ClientTlsConfig;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, info, instrument};
 use utils::{build_endpoint, tracing::Inject};
+// TODO: use our own status type
+// use xlinerpc::status::Status;
 
 use crate::{
     members::ServerId,
@@ -170,10 +173,7 @@ pub(crate) trait ConnectApi: Send + Sync + 'static {
     ) -> Result<RecordResponse, CurpError>;
 
     /// Send `ReadIndexRequest`
-    async fn read_index(
-        &self,
-        timeout: Duration,
-    ) -> Result<ReadIndexResponse, CurpError>;
+    async fn read_index(&self, timeout: Duration) -> Result<ReadIndexResponse, CurpError>;
 
     /// Send `ProposeRequest`
     async fn propose_conf_change(
@@ -356,7 +356,7 @@ impl<C> Connect<C> {
 
     /// After RPC
     #[cfg(feature = "client-metrics")]
-    fn after_rpc<R>(&self, start_at: std::time::Instant, res: &Result<R, tonic::Status>) {
+    fn after_rpc<R>(&self, start_at: std::time::Instant, res: &Result<R, Status>) {
         super::metrics::get().peer_round_trip_time_seconds.record(
             start_at.elapsed().as_secs(),
             &[opentelemetry::KeyValue::new("to", self.id.to_string())],
@@ -378,7 +378,7 @@ macro_rules! with_timeout {
     ($timeout:expr_2021, $client_op:expr_2021) => {
         tokio::time::timeout($timeout, $client_op)
             .await
-            .map_err(|_| tonic::Status::deadline_exceeded("timeout"))?
+            .map_err(|_| Status::deadline_exceeded("timeout"))?
     };
 }
 
@@ -426,10 +426,7 @@ impl ConnectApi for Connect<ProtocolClient<Channel>> {
     }
 
     /// Send `ReadIndexRequest`
-    async fn read_index(
-        &self,
-        timeout: Duration,
-    ) -> Result<ReadIndexResponse, CurpError> {
+    async fn read_index(&self, timeout: Duration) -> Result<ReadIndexResponse, CurpError> {
         let mut client = self.connect.clone();
         let req = tonic::Request::new(ReadIndexRequest {});
         with_timeout!(timeout, client.read_index(req))
@@ -738,10 +735,7 @@ where
             .map_err(Into::into)
     }
 
-    async fn read_index(
-        &self,
-        _timeout: Duration,
-    ) -> Result<ReadIndexResponse, CurpError> {
+    async fn read_index(&self, _timeout: Duration) -> Result<ReadIndexResponse, CurpError> {
         let mut req = tonic::Request::new(ReadIndexRequest {});
         req.metadata_mut().inject_bypassed();
         req.metadata_mut().inject_current();
@@ -934,12 +928,10 @@ mod quic_connect_impl {
         rpc::{
             AppendEntriesRequest, AppendEntriesResponse, CurpError, FetchClusterRequest,
             FetchClusterResponse, FetchReadStateRequest, FetchReadStateResponse,
-            InstallSnapshotResponse, LeaseKeepAliveMsg,
-            MoveLeaderRequest, MoveLeaderResponse, OpResponse, ProposeConfChangeRequest,
-            ProposeConfChangeResponse, ProposeRequest, PublishRequest, PublishResponse,
-            ReadIndexResponse, RecordRequest, RecordResponse, ShutdownRequest, ShutdownResponse,
-            VoteRequest, VoteResponse,
-            MethodId,
+            InstallSnapshotResponse, LeaseKeepAliveMsg, MethodId, MoveLeaderRequest,
+            MoveLeaderResponse, OpResponse, ProposeConfChangeRequest, ProposeConfChangeResponse,
+            ProposeRequest, PublishRequest, PublishResponse, ReadIndexResponse, RecordRequest,
+            RecordResponse, ShutdownRequest, ShutdownResponse, VoteRequest, VoteResponse,
             quic_transport::channel::QuicChannel,
         },
         snapshot::Snapshot,
@@ -957,9 +949,7 @@ mod quic_connect_impl {
 
     impl std::fmt::Debug for QuicConnect {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("QuicConnect")
-                .field("id", &self.id)
-                .finish()
+            f.debug_struct("QuicConnect").field("id", &self.id).finish()
         }
     }
 
@@ -992,14 +982,13 @@ mod quic_connect_impl {
                 meta.push(("token".to_owned(), token));
             }
             self.channel
-                .server_streaming_call(
-                    MethodId::ProposeStream,
-                    request,
-                    meta,
-                    timeout,
-                )
+                .server_streaming_call(MethodId::ProposeStream, request, meta, timeout)
                 .await
-                .map(|s| -> Box<dyn Stream<Item = Result<OpResponse, CurpError>> + Send> { Box::new(s) })
+                .map(
+                    |s| -> Box<dyn Stream<Item = Result<OpResponse, CurpError>> + Send> {
+                        Box::new(s)
+                    },
+                )
         }
 
         async fn record(
@@ -1015,12 +1004,7 @@ mod quic_connect_impl {
         async fn read_index(&self, timeout: Duration) -> Result<ReadIndexResponse, CurpError> {
             use crate::rpc::proto::commandpb::ReadIndexRequest;
             self.channel
-                .unary_call(
-                    MethodId::ReadIndex,
-                    ReadIndexRequest {},
-                    vec![],
-                    timeout,
-                )
+                .unary_call(MethodId::ReadIndex, ReadIndexRequest {}, vec![], timeout)
                 .await
         }
 
@@ -1030,12 +1014,7 @@ mod quic_connect_impl {
             timeout: Duration,
         ) -> Result<ProposeConfChangeResponse, CurpError> {
             self.channel
-                .unary_call(
-                    MethodId::ProposeConfChange,
-                    request,
-                    vec![],
-                    timeout,
-                )
+                .unary_call(MethodId::ProposeConfChange, request, vec![], timeout)
                 .await
         }
 
@@ -1065,12 +1044,7 @@ mod quic_connect_impl {
             timeout: Duration,
         ) -> Result<FetchClusterResponse, CurpError> {
             self.channel
-                .unary_call(
-                    MethodId::FetchCluster,
-                    request,
-                    vec![],
-                    timeout,
-                )
+                .unary_call(MethodId::FetchCluster, request, vec![], timeout)
                 .await
         }
 
@@ -1080,12 +1054,7 @@ mod quic_connect_impl {
             timeout: Duration,
         ) -> Result<FetchReadStateResponse, CurpError> {
             self.channel
-                .unary_call(
-                    MethodId::FetchReadState,
-                    request,
-                    vec![],
-                    timeout,
-                )
+                .unary_call(MethodId::FetchReadState, request, vec![], timeout)
                 .await
         }
 
@@ -1095,12 +1064,7 @@ mod quic_connect_impl {
             timeout: Duration,
         ) -> Result<MoveLeaderResponse, CurpError> {
             self.channel
-                .unary_call(
-                    MethodId::MoveLeader,
-                    request,
-                    vec![],
-                    timeout,
-                )
+                .unary_call(MethodId::MoveLeader, request, vec![], timeout)
                 .await
         }
 
@@ -1186,12 +1150,7 @@ mod quic_connect_impl {
             timeout: Duration,
         ) -> Result<AppendEntriesResponse, CurpError> {
             self.channel
-                .unary_call(
-                    MethodId::AppendEntries,
-                    request,
-                    vec![],
-                    timeout,
-                )
+                .unary_call(MethodId::AppendEntries, request, vec![], timeout)
                 .await
         }
 
@@ -1201,12 +1160,7 @@ mod quic_connect_impl {
             timeout: Duration,
         ) -> Result<VoteResponse, CurpError> {
             self.channel
-                .unary_call(
-                    MethodId::Vote,
-                    request,
-                    vec![],
-                    timeout,
-                )
+                .unary_call(MethodId::Vote, request, vec![], timeout)
                 .await
         }
 

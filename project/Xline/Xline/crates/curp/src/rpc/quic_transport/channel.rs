@@ -172,10 +172,9 @@ impl QuicChannel {
                 #[cfg(any(test, feature = "quic-test"))]
                 DnsFallback::LocalhostForTest => {
                     // Test mode: unconditionally fall back to 127.0.0.1
-                    let (server_name, port_str) =
-                        addr_str.rsplit_once(':').ok_or_else(|| {
-                            CurpError::internal(format!("invalid address format: {addr_str}"))
-                        })?;
+                    let (server_name, port_str) = addr_str.rsplit_once(':').ok_or_else(|| {
+                        CurpError::internal(format!("invalid address format: {addr_str}"))
+                    })?;
                     let port: u16 = port_str.parse().map_err(|_| {
                         CurpError::internal(format!("invalid port in address: {addr_str}"))
                     })?;
@@ -188,9 +187,7 @@ impl QuicChannel {
                     self.client
                         .connected_to(server_name, [fallback_addr])
                         .map_err(|e2| {
-                            CurpError::internal(format!(
-                                "QUIC connect error: {e2} (original: {e})"
-                            ))
+                            CurpError::internal(format!("QUIC connect error: {e2} (original: {e})"))
                         })
                 }
             },
@@ -198,9 +195,7 @@ impl QuicChannel {
     }
 
     /// Open a bidirectional stream on the connection
-    async fn open_bi_stream(
-        conn: &Connection,
-    ) -> Result<(StreamReader, StreamWriter), CurpError> {
+    async fn open_bi_stream(conn: &Connection) -> Result<(StreamReader, StreamWriter), CurpError> {
         let result = conn
             .open_bi_stream()
             .await
@@ -434,14 +429,8 @@ impl QuicChannel {
         .await;
 
         // === Unconditional cleanup: runs on success, error, AND timeout ===
-        let taken_cancel = cancel_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let taken_handle = send_handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let taken_cancel = cancel_tx.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let taken_handle = send_handle.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(handle) = taken_handle {
             if let Some(tx) = taken_cancel {
                 let _ = tx.send(());
@@ -526,7 +515,9 @@ impl QuicChannel {
             writer.flush().await?;
 
             let mut send_stream: StreamWriter = writer.into_inner();
-            send_stream.shutdown().await
+            send_stream
+                .shutdown()
+                .await
                 .map_err(|e| CurpError::internal(format!("shutdown error: {e}")))?;
 
             // Read response — same validation as unary_call
@@ -537,7 +528,9 @@ impl QuicChannel {
                     return Err(Self::decode_error(&details)?);
                 }
                 _ => {
-                    return Err(CurpError::internal("unexpected frame in raw unary response"));
+                    return Err(CurpError::internal(
+                        "unexpected frame in raw unary response",
+                    ));
                 }
             };
 
@@ -647,8 +640,9 @@ where
                             if code == status_ok() {
                                 Poll::Ready(None)
                             } else {
-                                Poll::Ready(Some(Err(QuicChannel::decode_error(&details)
-                                    .unwrap_or_else(|e| e))))
+                                Poll::Ready(Some(Err(
+                                    QuicChannel::decode_error(&details).unwrap_or_else(|e| e)
+                                )))
                             }
                         }
                         Ok(Frame::End) => {

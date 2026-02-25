@@ -917,12 +917,7 @@ impl TraceConfig {
     /// Generate a new `TraceConfig` object
     #[must_use]
     #[inline]
-    pub fn new(
-        online: bool,
-        offline: bool,
-        output_dir: PathBuf,
-        level: LevelConfig,
-    ) -> Self {
+    pub fn new(online: bool, offline: bool, output_dir: PathBuf, level: LevelConfig) -> Self {
         Self {
             online,
             offline,

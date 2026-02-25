@@ -11,7 +11,9 @@ use curp_external_api::{
 use futures::Stream;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-
+use tonic::{Code, Status};
+// TODO: use our own status type
+// use xlinerpc::status::{Code,Status};
 pub(crate) use self::proto::{
     commandpb::CurpError as CurpErrorWrapper,
     inner_messagepb::{
@@ -249,10 +251,8 @@ pub(crate) trait CurpService: Send + Sync + 'static {
 #[async_trait]
 pub(crate) trait InnerCurpService: Send + Sync + 'static {
     /// Handle append entries request
-    fn append_entries(
-        &self,
-        req: AppendEntriesRequest,
-    ) -> Result<AppendEntriesResponse, CurpError>;
+    fn append_entries(&self, req: AppendEntriesRequest)
+    -> Result<AppendEntriesResponse, CurpError>;
 
     /// Handle vote request
     fn vote(&self, req: VoteRequest) -> Result<VoteResponse, CurpError>;
@@ -938,10 +938,10 @@ impl<E: std::error::Error + 'static> From<E> for CurpError {
     #[inline]
     fn from(value: E) -> Self {
         let err: &dyn std::error::Error = &value;
-        if let Some(status) = err.downcast_ref::<tonic::Status>() {
+        if let Some(status) = err.downcast_ref::<Status>() {
             // Unavailable code often occurs in rpc connection errors,
-            // Please DO NOT use this code in CurpError to tonic::Status.
-            if status.code() == tonic::Code::Unavailable {
+            // Please DO NOT use this code in CurpError to Status.
+            if status.code() == Code::Unavailable {
                 return Self::RpcTransport(());
             }
             if !status.details().is_empty() {
@@ -959,68 +959,68 @@ impl<E: std::error::Error + 'static> From<E> for CurpError {
     }
 }
 
-impl From<CurpError> for tonic::Status {
+impl From<CurpError> for Status {
     #[inline]
     fn from(err: CurpError) -> Self {
         let (code, msg) = match err {
             CurpError::KeyConflict(()) => (
-                tonic::Code::AlreadyExists,
+                Code::AlreadyExists,
                 "Key conflict error: A key conflict occurred.",
             ),
             CurpError::Duplicated(()) => (
-                tonic::Code::AlreadyExists,
+                Code::AlreadyExists,
                 "Duplicated error: The request already sent.",
             ),
             CurpError::ExpiredClientId(()) => (
-                tonic::Code::FailedPrecondition,
+                Code::FailedPrecondition,
                 "Expired client ID error: The client ID has expired, we cannot tell if this request is duplicated.",
             ),
             CurpError::InvalidConfig(()) => (
-                tonic::Code::InvalidArgument,
+                Code::InvalidArgument,
                 "Invalid config error: The provided configuration is invalid.",
             ),
             CurpError::NodeNotExists(()) => (
-                tonic::Code::NotFound,
+                Code::NotFound,
                 "Node not found error: The specified node does not exist.",
             ),
             CurpError::NodeAlreadyExists(()) => (
-                tonic::Code::AlreadyExists,
+                Code::AlreadyExists,
                 "Node already exists error: The node already exists.",
             ),
             CurpError::LearnerNotCatchUp(()) => (
-                tonic::Code::FailedPrecondition,
+                Code::FailedPrecondition,
                 "Learner not caught up error: The learner has not caught up.",
             ),
             CurpError::ShuttingDown(()) => (
-                tonic::Code::FailedPrecondition,
+                Code::FailedPrecondition,
                 "Shutting down error: The service is currently shutting down.",
             ),
             CurpError::WrongClusterVersion(()) => (
-                tonic::Code::FailedPrecondition,
+                Code::FailedPrecondition,
                 "Wrong cluster version error: The cluster version is incorrect.",
             ),
             CurpError::Redirect(_) => (
-                tonic::Code::ResourceExhausted,
+                Code::ResourceExhausted,
                 "Redirect error: The request should be redirected to another node.",
             ),
             CurpError::Internal(_) => (
-                tonic::Code::Internal,
+                Code::Internal,
                 "Internal error: An internal error occurred.",
             ),
-            CurpError::RpcTransport(()) => (tonic::Code::Cancelled, "Rpc error: Request cancelled"),
+            CurpError::RpcTransport(()) => (Code::Cancelled, "Rpc error: Request cancelled"),
             CurpError::LeaderTransfer(_) => (
-                tonic::Code::FailedPrecondition,
+                Code::FailedPrecondition,
                 "Leader transfer error: A leader transfer error occurred.",
             ),
             CurpError::Zombie(()) => (
-                tonic::Code::FailedPrecondition,
+                Code::FailedPrecondition,
                 "Zombie leader error: The leader is a zombie with outdated term.",
             ),
         };
 
         let details = CurpErrorWrapper { err: Some(err) }.encode_to_vec();
 
-        tonic::Status::with_details(code, msg, details.into())
+        Status::with_details(code, msg, details.into())
     }
 }
 

@@ -2,11 +2,14 @@ use opentelemetry::{
     global,
     propagation::{Extractor, Injector},
 };
+use tonic::metadata::MetadataMap;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+// TODO: use our own MetaData.
+// use xlinerpc::MetaData as MetaDataMap;
 
 /// Struct for extract data from `MetadataMap`
-struct ExtractMap<'a>(&'a tonic::metadata::MetadataMap);
+struct ExtractMap<'a>(&'a MetadataMap);
 
 impl Extractor for ExtractMap<'_> {
     /// Get a value for a key from the `MetadataMap`.  If the value can't be converted to &str, returns None
@@ -32,7 +35,7 @@ pub trait Extract {
     fn extract_span(&self);
 }
 
-impl Extract for tonic::metadata::MetadataMap {
+impl Extract for MetadataMap {
     #[inline]
     fn extract_span(&self) {
         let parent_ctx = global::get_text_map_propagator(|prop| prop.extract(&ExtractMap(self)));
@@ -42,7 +45,7 @@ impl Extract for tonic::metadata::MetadataMap {
 }
 
 /// Struct for inject data to `MetadataMap`
-struct InjectMap<'a>(&'a mut tonic::metadata::MetadataMap);
+struct InjectMap<'a>(&'a mut MetadataMap);
 
 impl Injector for InjectMap<'_> {
     /// Set a key and value in the `MetadataMap`.  Does nothing if the key or value are not valid inputs
@@ -68,7 +71,7 @@ pub trait Inject {
     }
 }
 
-impl Inject for tonic::metadata::MetadataMap {
+impl Inject for MetadataMap {
     #[inline]
     fn inject_span(&mut self, span: &Span) {
         let ctx = span.context();

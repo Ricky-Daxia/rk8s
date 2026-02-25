@@ -10,7 +10,9 @@ use clippy_utilities::NumericCast;
 /// Bits of usize
 const USIZE_BITS: usize = {
     #[allow(clippy::as_conversions)]
-    { usize::BITS as usize }
+    {
+        usize::BITS as usize
+    }
 };
 
 /// Default bit vec queue capacity, this is the number of inflight requests that a client expects.

@@ -38,6 +38,7 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+xlinerpc = { path = "../xlinerpc", version = "0.1.0"}
 
 [dev-dependencies]
 opentelemetry = { workspace = true }

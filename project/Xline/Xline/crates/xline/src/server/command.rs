@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use engine::{Snapshot, TransactionApi};
 use event_listener::Event;
 use parking_lot::RwLock;
+use tonic::Status;
 use tracing::warn;
 use utils::{barrier::IdBarrier, table_names::META_TABLE};
 use xlineapi::{
@@ -20,6 +21,8 @@ use xlineapi::{
     command::{Command, CurpClient, SyncResponse},
     execute_error::ExecuteError,
 };
+// TODO: use our own status type
+// use xlinerpc::status::Status;
 
 use crate::{
     revision_number::RevisionNumberGeneratorState,
@@ -206,7 +209,7 @@ impl Alarmer {
     }
 
     /// Propose alarm request to other nodes
-    async fn alarm(&self, action: AlarmAction, alarm: AlarmType) -> Result<(), tonic::Status> {
+    async fn alarm(&self, action: AlarmAction, alarm: AlarmType) -> Result<(), Status> {
         let request = RequestWrapper::from(AlarmRequest::new(action, self.id, alarm));
         let cmd = Command::new(request);
         let _ig = self.client.propose(&cmd, None, true).await?;
@@ -526,9 +529,7 @@ impl CurpCommandExecutor<Command> for CommandExecutor {
         general_revision_state.commit();
         auth_revision_state.commit();
 
-        if !quota_enough
-            && let Some(alarmer) = self.alarmer.read().clone()
-        {
+        if !quota_enough && let Some(alarmer) = self.alarmer.read().clone() {
             let _ig = tokio::spawn(async move {
                 if let Err(e) = alarmer
                     .alarm(AlarmAction::Activate, AlarmType::Nospace)

@@ -411,10 +411,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     }
 
     /// Write metadata entries (shared by `write_request_header` and test helper)
-    async fn write_metadata(
-        &mut self,
-        meta: &[(String, String)],
-    ) -> Result<(), CurpError> {
+    async fn write_metadata(&mut self, meta: &[(String, String)]) -> Result<(), CurpError> {
         if meta.len() > MAX_METADATA_ENTRIES as usize {
             return Err(CurpError::internal("header too large: metadata entries"));
         }
@@ -579,7 +576,8 @@ pub(crate) async fn read_request_header<R: AsyncRead + Unpin>(
             return Err(CurpError::internal("header too large: metadata key"));
         }
         let mut key_bytes = vec![0u8; key_len as usize];
-        let _ = r.read_exact(&mut key_bytes)
+        let _ = r
+            .read_exact(&mut key_bytes)
             .await
             .map_err(|e| CurpError::internal(format!("read key error: {e}")))?;
         let key = String::from_utf8(key_bytes)
@@ -593,7 +591,8 @@ pub(crate) async fn read_request_header<R: AsyncRead + Unpin>(
             return Err(CurpError::internal("header too large: metadata value"));
         }
         let mut value_bytes = vec![0u8; value_len as usize];
-        let _ = r.read_exact(&mut value_bytes)
+        let _ = r
+            .read_exact(&mut value_bytes)
             .await
             .map_err(|e| CurpError::internal(format!("read value error: {e}")))?;
         let value = String::from_utf8(value_bytes)
@@ -629,7 +628,10 @@ mod tests {
 
         let mut writer = FrameWriter::new(client_write);
         let data = b"hello world".to_vec();
-        writer.write_frame(&Frame::Data(data.clone())).await.unwrap();
+        writer
+            .write_frame(&Frame::Data(data.clone()))
+            .await
+            .unwrap();
 
         let mut reader = FrameReader::new_unary_response(read_half);
         let frame = reader.read_frame().await.unwrap();
@@ -644,7 +646,10 @@ mod tests {
 
         let mut writer = FrameWriter::new(client_write);
         // First send DATA, then END for client-streaming
-        writer.write_frame(&Frame::Data(vec![1, 2, 3])).await.unwrap();
+        writer
+            .write_frame(&Frame::Data(vec![1, 2, 3]))
+            .await
+            .unwrap();
         writer.write_frame(&Frame::End).await.unwrap();
 
         let mut reader = FrameReader::new_client_streaming(read_half);
@@ -663,7 +668,10 @@ mod tests {
 
         let mut writer = FrameWriter::new(client_write);
         // For unary response: DATA then STATUS
-        writer.write_frame(&Frame::Data(vec![1, 2, 3])).await.unwrap();
+        writer
+            .write_frame(&Frame::Data(vec![1, 2, 3]))
+            .await
+            .unwrap();
         writer
             .write_frame(&Frame::Status {
                 code: status_ok(),
@@ -691,7 +699,10 @@ mod tests {
             ("bypass".to_owned(), "true".to_owned()),
             ("token".to_owned(), "jwt123".to_owned()),
         ];
-        writer.write_request_header(MethodId::FetchCluster, &meta).await.unwrap();
+        writer
+            .write_request_header(MethodId::FetchCluster, &meta)
+            .await
+            .unwrap();
 
         let (method_raw, read_meta) = read_request_header(&mut read_half).await.unwrap();
         assert_eq!(method_raw, MethodId::FetchCluster.as_u16());
@@ -810,26 +821,25 @@ mod tests {
     #[test]
     fn test_method_id_frozen_mapping() {
         // Protocol service (0x00xx)
-        assert_eq!(MethodId::FetchCluster.as_u16(),       0x0001);
-        assert_eq!(MethodId::FetchReadState.as_u16(),     0x0002);
-        assert_eq!(MethodId::Record.as_u16(),             0x0003);
-        assert_eq!(MethodId::ReadIndex.as_u16(),          0x0004);
-        assert_eq!(MethodId::Shutdown.as_u16(),           0x0005);
-        assert_eq!(MethodId::ProposeConfChange.as_u16(),  0x0006);
-        assert_eq!(MethodId::Publish.as_u16(),            0x0007);
-        assert_eq!(MethodId::MoveLeader.as_u16(),         0x0008);
-        assert_eq!(MethodId::ProposeStream.as_u16(),      0x0009);
-        assert_eq!(MethodId::LeaseKeepAlive.as_u16(),     0x000A);
+        assert_eq!(MethodId::FetchCluster.as_u16(), 0x0001);
+        assert_eq!(MethodId::FetchReadState.as_u16(), 0x0002);
+        assert_eq!(MethodId::Record.as_u16(), 0x0003);
+        assert_eq!(MethodId::ReadIndex.as_u16(), 0x0004);
+        assert_eq!(MethodId::Shutdown.as_u16(), 0x0005);
+        assert_eq!(MethodId::ProposeConfChange.as_u16(), 0x0006);
+        assert_eq!(MethodId::Publish.as_u16(), 0x0007);
+        assert_eq!(MethodId::MoveLeader.as_u16(), 0x0008);
+        assert_eq!(MethodId::ProposeStream.as_u16(), 0x0009);
+        assert_eq!(MethodId::LeaseKeepAlive.as_u16(), 0x000A);
 
         // InnerProtocol service (0x01xx)
-        assert_eq!(MethodId::AppendEntries.as_u16(),      0x0101);
-        assert_eq!(MethodId::Vote.as_u16(),               0x0102);
-        assert_eq!(MethodId::InstallSnapshot.as_u16(),    0x0103);
-        assert_eq!(MethodId::TriggerShutdown.as_u16(),    0x0104);
+        assert_eq!(MethodId::AppendEntries.as_u16(), 0x0101);
+        assert_eq!(MethodId::Vote.as_u16(), 0x0102);
+        assert_eq!(MethodId::InstallSnapshot.as_u16(), 0x0103);
+        assert_eq!(MethodId::TriggerShutdown.as_u16(), 0x0104);
         assert_eq!(MethodId::TryBecomeLeaderNow.as_u16(), 0x0105);
 
         // Total count guard: if you add a new method, update this assertion.
         assert_eq!(ALL_METHOD_IDS.len(), 15);
     }
-
 }

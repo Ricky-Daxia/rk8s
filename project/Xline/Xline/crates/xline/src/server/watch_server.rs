@@ -7,10 +7,12 @@ use std::{
 use event_listener::Event;
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
+use tonic::Status;
 use tracing::{debug, warn};
 use utils::task_manager::{Listener, TaskManager, tasks::TaskName};
 use xlineapi::command::KeyRange;
-
+// TODO: use our own status type
+// use xlinerpc::status::Status;
 use crate::{
     header_gen::HeaderGenerator,
     rpc::{
@@ -60,13 +62,13 @@ impl WatchServer {
     async fn task<ST, W>(
         next_id_gen: Arc<WatchIdGenerator>,
         kv_watcher: Arc<W>,
-        res_tx: mpsc::Sender<Result<WatchResponse, tonic::Status>>,
+        res_tx: mpsc::Sender<Result<WatchResponse, Status>>,
         mut req_rx: ST,
         header_gen: Arc<HeaderGenerator>,
         watch_progress_notify_interval: Duration,
         shutdown_listener: Listener,
     ) where
-        ST: Stream<Item = Result<WatchRequest, tonic::Status>> + Unpin,
+        ST: Stream<Item = Result<WatchRequest, Status>> + Unpin,
         W: KvWatcherOps,
     {
         let (event_tx, mut event_rx) = mpsc::channel(CHANNEL_SIZE);
@@ -130,7 +132,7 @@ where
     /// KV watcher
     kv_watcher: Arc<W>,
     /// `WatchResponse` Sender
-    response_tx: mpsc::Sender<Result<WatchResponse, tonic::Status>>,
+    response_tx: mpsc::Sender<Result<WatchResponse, Status>>,
     /// Event sender
     event_tx: mpsc::Sender<WatchEvent>,
     /// Watch ID to watcher map
@@ -158,7 +160,7 @@ where
     /// New `WatchHandle`
     fn new(
         kv_watcher: Arc<W>,
-        response_tx: mpsc::Sender<Result<WatchResponse, tonic::Status>>,
+        response_tx: mpsc::Sender<Result<WatchResponse, Status>>,
         event_tx: mpsc::Sender<WatchEvent>,
         stop_notify: Arc<Event>,
         next_id_gen: Arc<WatchIdGenerator>,
@@ -197,7 +199,7 @@ where
     /// Handle `WatchCreateRequest`
     async fn handle_watch_create(&mut self, req: WatchCreateRequest) {
         let Some(watch_id) = self.validate_watch_id(req.watch_id) else {
-            let result = Err(tonic::Status::already_exists(format!(
+            let result = Err(Status::already_exists(format!(
                 "Watch ID {} has already been used",
                 req.watch_id
             )));
@@ -258,7 +260,7 @@ where
             };
             Ok(response)
         } else {
-            Err(tonic::Status::not_found(format!(
+            Err(Status::not_found(format!(
                 "Watch ID {} doesn't exist",
                 req.watch_id
             )))
@@ -380,7 +382,7 @@ where
 #[tonic::async_trait]
 impl Watch for WatchServer {
     ///Server streaming response type for the Watch method.
-    type WatchStream = ReceiverStream<Result<WatchResponse, tonic::Status>>;
+    type WatchStream = ReceiverStream<Result<WatchResponse, Status>>;
 
     /// Watch watches for events happening or that have happened. Both input and output
     /// are streams; the input stream is for creating and canceling watchers and the output
@@ -390,7 +392,7 @@ impl Watch for WatchServer {
     async fn watch(
         &self,
         request: tonic::Request<tonic::Streaming<WatchRequest>>,
-    ) -> Result<tonic::Response<Self::WatchStream>, tonic::Status> {
+    ) -> Result<tonic::Response<Self::WatchStream>, Status> {
         debug!("Receive Watch Connection {:?}", request);
         let req_stream = request.into_inner();
         let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
@@ -471,8 +473,7 @@ mod test {
         let task_manager = Arc::new(TaskManager::new());
         let (req_tx, req_rx) = mpsc::channel(CHANNEL_SIZE);
         let (res_tx, mut res_rx) = mpsc::channel(CHANNEL_SIZE);
-        let req_stream: ReceiverStream<Result<WatchRequest, tonic::Status>> =
-            ReceiverStream::new(req_rx);
+        let req_stream: ReceiverStream<Result<WatchRequest, Status>> = ReceiverStream::new(req_rx);
         let header_gen = Arc::new(HeaderGenerator::new(0, 0));
         let mut mock_watcher = MockKvWatcherOps::new();
         let _ = mock_watcher.expect_watch().times(1).return_const(());
@@ -538,7 +539,7 @@ mod test {
 
         let (req_tx1, req_rx1) = mpsc::channel(CHANNEL_SIZE);
         let (res_tx1, _res_rx1) = mpsc::channel(CHANNEL_SIZE);
-        let req_stream1: ReceiverStream<Result<WatchRequest, tonic::Status>> =
+        let req_stream1: ReceiverStream<Result<WatchRequest, Status>> =
             ReceiverStream::new(req_rx1);
         task_manager.spawn(TaskName::WatchTask, |n| {
             WatchServer::task(
@@ -554,7 +555,7 @@ mod test {
 
         let (req_tx2, req_rx2) = mpsc::channel(CHANNEL_SIZE);
         let (res_tx2, _res_rx2) = mpsc::channel(CHANNEL_SIZE);
-        let req_stream2: ReceiverStream<Result<WatchRequest, tonic::Status>> =
+        let req_stream2: ReceiverStream<Result<WatchRequest, Status>> =
             ReceiverStream::new(req_rx2);
         task_manager.spawn(TaskName::WatchTask, |n| {
             WatchServer::task(
@@ -664,8 +665,7 @@ mod test {
         let task_manager = Arc::new(TaskManager::new());
         let (req_tx, req_rx) = mpsc::channel(CHANNEL_SIZE);
         let (res_tx, mut res_rx) = mpsc::channel(CHANNEL_SIZE);
-        let req_stream: ReceiverStream<Result<WatchRequest, tonic::Status>> =
-            ReceiverStream::new(req_rx);
+        let req_stream: ReceiverStream<Result<WatchRequest, Status>> = ReceiverStream::new(req_rx);
         let header_gen = Arc::new(HeaderGenerator::new(0, 0));
         let mut mock_watcher = MockKvWatcherOps::new();
         let _ = mock_watcher.expect_watch().times(1).return_const(());
@@ -728,8 +728,7 @@ mod test {
         let task_manager = Arc::new(TaskManager::new());
         let (req_tx, req_rx) = mpsc::channel(CHANNEL_SIZE);
         let (res_tx, res_rx) = mpsc::channel(CHANNEL_SIZE);
-        let req_stream: ReceiverStream<Result<WatchRequest, tonic::Status>> =
-            ReceiverStream::new(req_rx);
+        let req_stream: ReceiverStream<Result<WatchRequest, Status>> = ReceiverStream::new(req_rx);
         let header_gen = Arc::new(HeaderGenerator::new(0, 0));
         let mut mock_watcher = MockKvWatcherOps::new();
         let _ = mock_watcher.expect_watch().times(1).return_const(());

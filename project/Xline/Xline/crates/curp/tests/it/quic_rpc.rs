@@ -26,12 +26,10 @@ async fn quic_fetch_cluster() {
     let group = QuicCurpGroup::new(3).await;
 
     let node = group.nodes.values().next().unwrap();
-    let channel: QuicChannel = QuicChannel::connect_single_for_test(
-        &node.addr,
-        Arc::clone(&group.quic_client),
-    )
-    .await
-    .unwrap();
+    let channel: QuicChannel =
+        QuicChannel::connect_single_for_test(&node.addr, Arc::clone(&group.quic_client))
+            .await
+            .unwrap();
 
     let resp: FetchClusterResponse = channel
         .unary_call(
@@ -117,12 +115,9 @@ async fn quic_unknown_method_returns_error() {
 
     let group = QuicCurpGroup::new(3).await;
     let node = group.nodes.values().next().unwrap();
-    let channel = QuicChannel::connect_single_for_test(
-        &node.addr,
-        Arc::clone(&group.quic_client),
-    )
-    .await
-    .unwrap();
+    let channel = QuicChannel::connect_single_for_test(&node.addr, Arc::clone(&group.quic_client))
+        .await
+        .unwrap();
 
     let result: Result<FetchClusterResponse, _> = channel
         .raw_unary_call(0xFFFF, vec![], vec![], Duration::from_secs(5))

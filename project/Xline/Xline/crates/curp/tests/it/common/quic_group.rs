@@ -11,13 +11,13 @@ use curp::{
     members::{ClusterInfo, ServerId},
     rpc::{FetchClusterRequest, FetchClusterResponse, MethodId, QuicChannel, QuicGrpcServer},
     server::{
+        DB, Rpc,
         conflict::test_pools::{TestSpecPool, TestUncomPool},
-        Rpc, DB,
     },
 };
 use curp_test_utils::{
-    test_cmd::{TestCE, TestCommand, TestCommandResult},
     TestRoleChange, TestRoleChangeInner,
+    test_cmd::{TestCE, TestCommand, TestCommandResult},
 };
 use engine::MemorySnapshotAllocator;
 use gm_quic::prelude::{QuicClient, QuicListeners};
@@ -71,10 +71,7 @@ impl TestCerts {
             ));
         }
 
-        Self {
-            ca_cert_der,
-            nodes,
-        }
+        Self { ca_cert_der, nodes }
     }
 }
 
@@ -123,9 +120,11 @@ impl QuicCurpGroup {
                     sni.as_str(),
                     cert_der.as_slice(),
                     key_der.as_slice(),
-                    vec![bind_uri_str
-                        .parse::<gm_quic::qbase::net::addr::BindUri>()
-                        .unwrap()],
+                    vec![
+                        bind_uri_str
+                            .parse::<gm_quic::qbase::net::addr::BindUri>()
+                            .unwrap(),
+                    ],
                     None::<Vec<u8>>,
                 )
                 .expect("add_server");
@@ -280,12 +279,15 @@ impl QuicCurpGroup {
     /// Try to get the current leader by querying all nodes via QUIC
     pub async fn try_get_leader(&self) -> Option<(ServerId, u64)> {
         for node in self.nodes.values() {
-            let channel =
-                match QuicChannel::connect_single_for_test(&node.addr, Arc::clone(&self.quic_client)).await
-                {
-                    Ok(ch) => ch,
-                    Err(_) => continue,
-                };
+            let channel = match QuicChannel::connect_single_for_test(
+                &node.addr,
+                Arc::clone(&self.quic_client),
+            )
+            .await
+            {
+                Ok(ch) => ch,
+                Err(_) => continue,
+            };
 
             let result: Result<FetchClusterResponse, curp::rpc::CurpError> = channel
                 .unary_call(

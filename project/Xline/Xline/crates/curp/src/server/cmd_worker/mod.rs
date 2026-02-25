@@ -258,17 +258,17 @@ pub(super) async fn worker_reset<C: Command, CE: CommandExecutor<C>, RC: RoleCha
             .reset(Some((snapshot.into_inner(), meta.last_included_index)))
             .await
         {
-                error!("reset failed, {e}");
-            } else {
-                debug_assert_eq!(
-                    ce.last_applied()
-                        .expect("failed to get last_applied from ce"),
-                    meta.last_included_index,
-                    "inconsistent last_applied"
-                );
-                debug!("{id}'s command executor has been reset by a snapshot");
-                curp.reset_by_snapshot(meta);
-            }
+            error!("reset failed, {e}");
+        } else {
+            debug_assert_eq!(
+                ce.last_applied()
+                    .expect("failed to get last_applied from ce"),
+                meta.last_included_index,
+                "inconsistent last_applied"
+            );
+            debug!("{id}'s command executor has been reset by a snapshot");
+            curp.reset_by_snapshot(meta);
+        }
     } else {
         if let Err(e) = ce.reset(None).await {
             error!("reset failed, {e}");

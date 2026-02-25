@@ -9,9 +9,11 @@ use event_listener::Event;
 use futures::{Future, stream::FuturesUnordered};
 use rand::seq::IteratorRandom;
 use tokio::sync::RwLock;
+use tonic::Status;
 use tonic::transport::ClientTlsConfig;
 use tracing::{debug, info};
-
+// TODO: use our own status type
+// use xlinerpc::status::Status;
 use crate::{
     members::ServerId,
     rpc::{
@@ -360,7 +362,7 @@ impl State {
     }
 
     /// Wait for client id
-    pub(super) async fn wait_for_client_id(&self) -> Result<u64, tonic::Status> {
+    pub(super) async fn wait_for_client_id(&self) -> Result<u64, Status> {
         /// Max retry count for waiting for a client ID
         ///
         /// TODO: This retry count is set relatively high to avoid test cluster startup timeouts.
@@ -378,9 +380,7 @@ impl State {
             tokio::time::sleep(RETRY_INTERVAL).await;
         }
 
-        Err(tonic::Status::deadline_exceeded(
-            "timeout waiting for client id",
-        ))
+        Err(Status::deadline_exceeded("timeout waiting for client id"))
     }
 }
 

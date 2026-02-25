@@ -5,6 +5,7 @@ use clippy_utilities::NumericCast;
 use curp::members::ClusterInfo;
 use futures::stream::Stream;
 use tokio::time;
+use tonic::Status;
 use tonic::transport::{ClientTlsConfig, Endpoint};
 use tracing::{debug, warn};
 use utils::{
@@ -15,7 +16,8 @@ use xlineapi::{
     command::{Command, CommandResponse, CurpClient, SyncResponse},
     execute_error::ExecuteError,
 };
-
+// TODO: use our own status type
+// use xlinerpc::status::Status;
 use crate::{
     id_gen::IdGenerator,
     metrics,
@@ -49,8 +51,7 @@ pub(crate) struct LeaseServer {
 }
 
 /// A lease keep alive stream
-type KeepAliveStream =
-    Pin<Box<dyn Stream<Item = Result<LeaseKeepAliveResponse, tonic::Status>> + Send>>;
+type KeepAliveStream = Pin<Box<dyn Stream<Item = Result<LeaseKeepAliveResponse, Status>> + Send>>;
 
 impl LeaseServer {
     /// New `LeaseServer`
@@ -119,7 +120,7 @@ impl LeaseServer {
     async fn propose<T>(
         &self,
         request: tonic::Request<T>,
-    ) -> Result<(CommandResponse, Option<SyncResponse>), tonic::Status>
+    ) -> Result<(CommandResponse, Option<SyncResponse>), Status>
     where
         T: Into<RequestWrapper>,
     {
@@ -131,15 +132,19 @@ impl LeaseServer {
     }
 
     /// Handle keep alive at leader
-    #[allow(clippy::arithmetic_side_effects, clippy::ignored_unit_patterns, clippy::result_large_err)] // Introduced by tokio::select!
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::ignored_unit_patterns,
+        clippy::result_large_err
+    )] // Introduced by tokio::select!
     fn leader_keep_alive(
         &self,
         mut request_stream: tonic::Streaming<LeaseKeepAliveRequest>,
-    ) -> Result<KeepAliveStream, tonic::Status> {
+    ) -> Result<KeepAliveStream, Status> {
         let shutdown_listener = self
             .task_manager
             .get_shutdown_listener(TaskName::LeaseKeepAlive)
-            .ok_or(tonic::Status::cancelled("The cluster is shutting down"))?;
+            .ok_or(Status::cancelled("The cluster is shutting down"))?;
         let lease_storage = Arc::clone(&self.lease_storage);
         let stream = try_stream! {
            loop {
@@ -168,7 +173,7 @@ impl LeaseServer {
                     };
                     lease_storage.keep_alive(keep_alive_req.id).map_err(Into::into)
                 } else {
-                    Err(tonic::Status::failed_precondition("current node is not a leader"))
+                    Err(Status::failed_precondition("current node is not a leader"))
                 }?;
                 yield LeaseKeepAliveResponse {
                     id: keep_alive_req.id,
@@ -186,11 +191,11 @@ impl LeaseServer {
         &self,
         mut request_stream: tonic::Streaming<LeaseKeepAliveRequest>,
         leader_addrs: &[String],
-    ) -> Result<KeepAliveStream, tonic::Status> {
+    ) -> Result<KeepAliveStream, Status> {
         let shutdown_listener = self
             .task_manager
             .get_shutdown_listener(TaskName::LeaseKeepAlive)
-            .ok_or(tonic::Status::cancelled("The cluster is shutting down"))?;
+            .ok_or(Status::cancelled("The cluster is shutting down"))?;
         let endpoints = build_endpoints(leader_addrs, self.client_tls_config.as_ref())?;
         let channel = tonic::transport::Channel::balance_list(endpoints.into_iter());
         let mut lease_client = LeaseClient::new(channel);
@@ -228,12 +233,12 @@ impl LeaseServer {
 fn build_endpoints(
     addrs: &[String],
     tls_config: Option<&ClientTlsConfig>,
-) -> Result<Vec<Endpoint>, tonic::Status> {
+) -> Result<Vec<Endpoint>, Status> {
     addrs
         .iter()
         .map(|addr| {
-            let endpoint = build_endpoint(addr, tls_config)
-                .map_err(|e| tonic::Status::internal(e.to_string()))?;
+            let endpoint =
+                build_endpoint(addr, tls_config).map_err(|e| Status::internal(e.to_string()))?;
             Ok(endpoint)
         })
         .collect()
@@ -247,7 +252,7 @@ impl Lease for LeaseServer {
     async fn lease_grant(
         &self,
         mut request: tonic::Request<LeaseGrantRequest>,
-    ) -> Result<tonic::Response<LeaseGrantResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<LeaseGrantResponse>, Status> {
         debug!("Receive LeaseGrantRequest {:?}", request);
         let lease_grant_req = request.get_mut();
         if lease_grant_req.id == 0 {
@@ -271,7 +276,7 @@ impl Lease for LeaseServer {
     async fn lease_revoke(
         &self,
         request: tonic::Request<LeaseRevokeRequest>,
-    ) -> Result<tonic::Response<LeaseRevokeResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<LeaseRevokeResponse>, Status> {
         debug!("Receive LeaseRevokeRequest {:?}", request);
 
         let (res, sync_res) = self.propose(request).await?;
@@ -290,14 +295,14 @@ impl Lease for LeaseServer {
 
     /// Server streaming response type for the `LeaseKeepAlive` method.
     type LeaseKeepAliveStream =
-        Pin<Box<dyn Stream<Item = Result<LeaseKeepAliveResponse, tonic::Status>> + Send>>;
+        Pin<Box<dyn Stream<Item = Result<LeaseKeepAliveResponse, Status>> + Send>>;
 
     /// `LeaseKeepAlive` keeps the lease alive by streaming keep alive requests from the client
     /// to the server and streaming keep alive responses from the server to the client.
     async fn lease_keep_alive(
         &self,
         request: tonic::Request<tonic::Streaming<LeaseKeepAliveRequest>>,
-    ) -> Result<tonic::Response<Self::LeaseKeepAliveStream>, tonic::Status> {
+    ) -> Result<tonic::Response<Self::LeaseKeepAliveStream>, Status> {
         debug!("Receive LeaseKeepAliveRequest {:?}", request);
         let request_stream = request.into_inner();
         let stream = loop {
@@ -327,7 +332,7 @@ impl Lease for LeaseServer {
     async fn lease_time_to_live(
         &self,
         request: tonic::Request<LeaseTimeToLiveRequest>,
-    ) -> Result<tonic::Response<LeaseTimeToLiveResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<LeaseTimeToLiveResponse>, Status> {
         debug!("Receive LeaseTimeToLiveRequest {:?}", request);
         loop {
             if self.lease_storage.is_primary() {
@@ -373,7 +378,7 @@ impl Lease for LeaseServer {
     async fn lease_leases(
         &self,
         request: tonic::Request<LeaseLeasesRequest>,
-    ) -> Result<tonic::Response<LeaseLeasesResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<LeaseLeasesResponse>, Status> {
         debug!("Receive LeaseLeasesRequest {:?}", request);
 
         let (res, sync_res) = self.propose(request).await?;

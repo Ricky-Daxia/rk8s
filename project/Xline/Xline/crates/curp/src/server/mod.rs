@@ -3,10 +3,12 @@ use std::{fmt::Debug, sync::Arc};
 use engine::SnapshotAllocator;
 use flume::r#async::RecvStream;
 use tokio::sync::broadcast;
+use tonic::Status;
 use tonic::transport::ClientTlsConfig;
 use tracing::instrument;
 use utils::{config::CurpConfig, task_manager::TaskManager, tracing::Extract};
-
+// TODO: use our own status type
+// use xlinerpc::status::Status;
 use self::curp_node::CurpNode;
 pub use self::{
     conflict::{spec_pool_new::SpObject, uncommitted_pool::UcpObject},
@@ -81,13 +83,13 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> Clone for Rpc<C, CE, RC
 
 #[tonic::async_trait]
 impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::Protocol for Rpc<C, CE, RC> {
-    type ProposeStreamStream = RecvStream<'static, Result<OpResponse, tonic::Status>>;
+    type ProposeStreamStream = RecvStream<'static, Result<OpResponse, Status>>;
 
     #[instrument(skip_all, name = "propose_stream")]
     async fn propose_stream(
         &self,
         request: tonic::Request<ProposeRequest>,
-    ) -> Result<tonic::Response<Self::ProposeStreamStream>, tonic::Status> {
+    ) -> Result<tonic::Response<Self::ProposeStreamStream>, Status> {
         let bypassed = request.metadata().is_bypassed();
         let (tx, rx) = flume::bounded(2);
         let resp_tx = Arc::new(ResponseSender::new(tx));
@@ -102,7 +104,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::Protocol fo
     async fn record(
         &self,
         request: tonic::Request<RecordRequest>,
-    ) -> Result<tonic::Response<RecordResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<RecordResponse>, Status> {
         Ok(tonic::Response::new(
             self.inner.record(&request.into_inner())?,
         ))
@@ -112,7 +114,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::Protocol fo
     async fn read_index(
         &self,
         _request: tonic::Request<ReadIndexRequest>,
-    ) -> Result<tonic::Response<ReadIndexResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<ReadIndexResponse>, Status> {
         Ok(tonic::Response::new(self.inner.read_index()?))
     }
 
@@ -120,7 +122,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::Protocol fo
     async fn shutdown(
         &self,
         request: tonic::Request<ShutdownRequest>,
-    ) -> Result<tonic::Response<ShutdownResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<ShutdownResponse>, Status> {
         let bypassed = request.metadata().is_bypassed();
         request.metadata().extract_span();
         Ok(tonic::Response::new(
@@ -132,7 +134,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::Protocol fo
     async fn propose_conf_change(
         &self,
         request: tonic::Request<ProposeConfChangeRequest>,
-    ) -> Result<tonic::Response<ProposeConfChangeResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<ProposeConfChangeResponse>, Status> {
         let bypassed = request.metadata().is_bypassed();
         request.metadata().extract_span();
         Ok(tonic::Response::new(
@@ -146,7 +148,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::Protocol fo
     async fn publish(
         &self,
         request: tonic::Request<PublishRequest>,
-    ) -> Result<tonic::Response<PublishResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<PublishResponse>, Status> {
         let bypassed = request.metadata().is_bypassed();
         request.metadata().extract_span();
         Ok(tonic::Response::new(
@@ -158,7 +160,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::Protocol fo
     async fn fetch_cluster(
         &self,
         request: tonic::Request<FetchClusterRequest>,
-    ) -> Result<tonic::Response<FetchClusterResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<FetchClusterResponse>, Status> {
         Ok(tonic::Response::new(
             self.inner.fetch_cluster(request.into_inner())?,
         ))
@@ -168,7 +170,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::Protocol fo
     async fn fetch_read_state(
         &self,
         request: tonic::Request<FetchReadStateRequest>,
-    ) -> Result<tonic::Response<FetchReadStateResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<FetchReadStateResponse>, Status> {
         Ok(tonic::Response::new(
             self.inner.fetch_read_state(request.into_inner())?,
         ))
@@ -178,7 +180,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::Protocol fo
     async fn move_leader(
         &self,
         request: tonic::Request<MoveLeaderRequest>,
-    ) -> Result<tonic::Response<MoveLeaderResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<MoveLeaderResponse>, Status> {
         Ok(tonic::Response::new(
             self.inner.move_leader(request.into_inner()).await?,
         ))
@@ -188,7 +190,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::Protocol fo
     async fn lease_keep_alive(
         &self,
         request: tonic::Request<tonic::Streaming<LeaseKeepAliveMsg>>,
-    ) -> Result<tonic::Response<LeaseKeepAliveMsg>, tonic::Status> {
+    ) -> Result<tonic::Response<LeaseKeepAliveMsg>, Status> {
         let req_stream = request.into_inner();
         Ok(tonic::Response::new(
             self.inner.lease_keep_alive(req_stream).await?,
@@ -204,7 +206,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::InnerProtoc
     async fn append_entries(
         &self,
         request: tonic::Request<AppendEntriesRequest>,
-    ) -> Result<tonic::Response<AppendEntriesResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<AppendEntriesResponse>, Status> {
         Ok(tonic::Response::new(
             self.inner.append_entries(request.get_ref())?,
         ))
@@ -214,7 +216,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::InnerProtoc
     async fn vote(
         &self,
         request: tonic::Request<VoteRequest>,
-    ) -> Result<tonic::Response<VoteResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<VoteResponse>, Status> {
         Ok(tonic::Response::new(
             self.inner.vote(&request.into_inner())?,
         ))
@@ -224,7 +226,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::InnerProtoc
     async fn trigger_shutdown(
         &self,
         request: tonic::Request<TriggerShutdownRequest>,
-    ) -> Result<tonic::Response<TriggerShutdownResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<TriggerShutdownResponse>, Status> {
         Ok(tonic::Response::new(
             self.inner.trigger_shutdown(*request.get_ref()),
         ))
@@ -234,7 +236,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::InnerProtoc
     async fn install_snapshot(
         &self,
         request: tonic::Request<tonic::Streaming<InstallSnapshotRequest>>,
-    ) -> Result<tonic::Response<InstallSnapshotResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<InstallSnapshotResponse>, Status> {
         let req_stream = request.into_inner();
         Ok(tonic::Response::new(
             self.inner.install_snapshot(req_stream).await?,
@@ -245,7 +247,7 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> crate::rpc::InnerProtoc
     async fn try_become_leader_now(
         &self,
         request: tonic::Request<TryBecomeLeaderNowRequest>,
-    ) -> Result<tonic::Response<TryBecomeLeaderNowResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<TryBecomeLeaderNowResponse>, Status> {
         Ok(tonic::Response::new(
             self.inner.try_become_leader_now(request.get_ref()).await?,
         ))
@@ -407,7 +409,6 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> Rpc<C, CE, RC> {
         }
     }
 
-
     /// Get a subscriber for leader changes
     #[inline]
     #[must_use]
@@ -422,7 +423,6 @@ impl<C: Command, CE: CommandExecutor<C>, RC: RoleChange> Rpc<C, CE, RC> {
         self.inner.raw_curp()
     }
 }
-
 
 // QUIC transport service trait implementations
 #[cfg(feature = "quic")]
@@ -442,7 +442,7 @@ mod quic_service_impl {
             InstallSnapshotRequest, InstallSnapshotResponse, LeaseKeepAliveMsg, Metadata,
             MoveLeaderRequest, MoveLeaderResponse, OpResponse, ProposeConfChangeRequest,
             ProposeConfChangeResponse, ProposeRequest, PublishRequest, PublishResponse,
-            RecordRequest, RecordResponse, ReadIndexResponse, ShutdownRequest, ShutdownResponse,
+            ReadIndexResponse, RecordRequest, RecordResponse, ShutdownRequest, ShutdownResponse,
             VoteRequest, VoteResponse,
         },
     };
@@ -561,7 +561,9 @@ mod quic_service_impl {
 
         async fn install_snapshot(
             &self,
-            stream: Box<dyn Stream<Item = Result<InstallSnapshotRequest, CurpError>> + Send + Unpin>,
+            stream: Box<
+                dyn Stream<Item = Result<InstallSnapshotRequest, CurpError>> + Send + Unpin,
+            >,
         ) -> Result<InstallSnapshotResponse, CurpError> {
             // Convert CurpError stream to tonic::Status stream for inner implementation
             let tonic_stream = stream.map(|r| r.map_err(|e| tonic::Status::from(e)));
@@ -579,7 +581,8 @@ mod quic_service_impl {
 
         async fn try_become_leader_now(&self) -> Result<(), CurpError> {
             use crate::rpc::TryBecomeLeaderNowRequest;
-            let _ = self.inner
+            let _ = self
+                .inner
                 .try_become_leader_now(&TryBecomeLeaderNowRequest {})
                 .await
                 .map_err(CurpError::from)?;
