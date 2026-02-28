@@ -20,6 +20,7 @@ use libruntime::utils::{
 
 use crate::commands::container::rootfs_mount::RootfsMount;
 use crate::config::image::CONFIG;
+use oci_spec::runtime::RootBuilder;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -365,9 +366,19 @@ impl TaskRunner {
             .ok_or_else(|| anyhow!("Pause container PID is not set"))?;
 
         let generator = OCISpecGenerator::new(config, container_spec, Some(pause_pid));
-        let spec = generator.generate().map_err(|e| {
+        let mut spec = generator.generate().map_err(|e| {
             anyhow!("failed to build OCI Specification for container {container_id}: {e}")
         })?;
+
+        // In overlay mode, override Root path to "merged" (OCISpecGenerator defaults to "rootfs")
+        if self.rootfs_mounts.contains_key(&container_id) {
+            let root = RootBuilder::default()
+                .path("merged")
+                .readonly(false)
+                .build()
+                .map_err(|e| anyhow!("failed to build root spec: {e}"))?;
+            spec.set_root(Some(root));
+        }
 
         let bundle_path = if let Some(image_spec) = &config.image {
             image_spec.image.clone()
