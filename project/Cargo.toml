@@ -3,6 +3,7 @@ members = [
     "distribution",
     "libbridge",
     "libcni",
+    "libcsi",
     "libnetwork",
     "libfuse-fs", 
     "rfuse3", 
@@ -28,6 +29,7 @@ common = { path = "common" }
 distribution = { path = "distribution" }
 libbridge = { path = "libbridge" }
 libcni = { path = "libcni" }
+libcsi = { path = "libcsi" }
 libfuse-fs = { path = "libfuse-fs" }
 libipam = { path = "libipam" }
 libnetwork = { path = "libnetwork" }

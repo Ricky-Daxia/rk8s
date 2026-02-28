@@ -4699,6 +4699,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "libcsi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "common",
+ "dashmap",
+ "nix 0.29.0",
+ "quinn",
+ "rcgen",
+ "rustls 0.23.35",
+ "serde",
+ "serde_json",
+ "slayerfs",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "libfuse-fs"
 version = "0.1.10"
 dependencies = [
