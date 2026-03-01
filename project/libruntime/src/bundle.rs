@@ -108,7 +108,12 @@ async fn extract_layers<P: AsRef<Path>, B: AsRef<Path>>(
     debug!("Image Config: {:?}", image_config);
 
     let layer_descriptors = image_manifest.layers();
-    assert_eq!(diff_ids.len(), layer_descriptors.len());
+    anyhow::ensure!(
+        diff_ids.len() == layer_descriptors.len(),
+        "OCI image layer count mismatch: diff_ids={} vs layer_descriptors={}",
+        diff_ids.len(),
+        layer_descriptors.len()
+    );
 
     let mut layers_futures = Vec::new();
     let bundle_path = PathBuf::from(bundle_path.as_ref());

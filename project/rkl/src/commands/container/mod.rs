@@ -596,6 +596,8 @@ pub fn run_container(path: &str, volumes: Option<Vec<String>>) -> Result<(), any
             // determine if the container is running
             if runner.load_container()?.can_start() {
                 runner.start_container(None)?;
+                info!("Container: {id} runs successfully!");
+                return Ok(());
             }
             warn!(
                 "Container: {id} can not start, status: {}! Creating a new one...",

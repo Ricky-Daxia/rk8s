@@ -91,21 +91,65 @@ impl RootfsMount {
 
         debug!("Spawning overlay daemon: {:?}", cmd);
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .context("Failed to spawn overlay daemon process")?;
         let mount_pid = child.id();
 
-        // Receive IPC sender sent by child process from parent_server
-        let (_, tx): (_, IpcSender<String>) = parent_server
-            .accept()
-            .context("Failed to accept IPC connection from daemon")?;
+        let ipc_timeout = Duration::from_secs(30);
 
-        // Wait for child process to send "ready"
-        let (_, msg) = child_server
-            .accept()
-            .context("Failed to receive ready signal from daemon")?;
+        // Receive IPC sender sent by child process from parent_server (with timeout).
+        // IpcOneShotServer::accept() blocks indefinitely, so run it in a thread
+        // and use mpsc::channel with recv_timeout to bound the wait.
+        let (ptx, prx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = ptx.send(parent_server.accept());
+        });
+        let tx: IpcSender<String> = match prx.recv_timeout(ipc_timeout) {
+            Ok(Ok((_, tx))) => tx,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("Failed to accept IPC connection from daemon: {e}"));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!(
+                    "Timed out waiting for IPC connection from overlay daemon (pid={mount_pid})"
+                ));
+            }
+        };
+
+        // Wait for child process to send "ready" (with timeout)
+        let (ctx, crx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = ctx.send(child_server.accept());
+        });
+        let msg = match crx.recv_timeout(ipc_timeout) {
+            Ok(Ok((_, msg))) => msg,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("Failed to receive ready signal from daemon: {e}"));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!(
+                    "Timed out waiting for ready signal from overlay daemon (pid={mount_pid})"
+                ));
+            }
+        };
+
+        // Check if child exited prematurely during IPC handshake
+        if let Some(status) = child.try_wait().context("Failed to check daemon status")? {
+            anyhow::bail!("Overlay daemon exited prematurely with status: {status}");
+        }
+
         if msg != "ready" {
+            let _ = child.kill();
+            let _ = child.wait();
             anyhow::bail!("Unexpected message from daemon: {msg}");
         }
 
@@ -304,9 +348,9 @@ impl RootfsMount {
 
     /// Poll /proc/<pid> existence until the process exits or timeout.
     /// Returns true if the process exited.
-    fn poll_proc_exit(&self, _pid: Pid, timeout: Duration) -> bool {
+    fn poll_proc_exit(&self, pid: Pid, timeout: Duration) -> bool {
         let start = Instant::now();
-        let proc_path = format!("/proc/{}", self.config.mount_pid);
+        let proc_path = format!("/proc/{}", pid.as_raw());
         loop {
             if !Path::new(&proc_path).exists() {
                 return true;

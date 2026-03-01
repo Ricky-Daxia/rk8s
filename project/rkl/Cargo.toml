@@ -24,7 +24,6 @@ libcgroups = { workspace = true }
 libcontainer = { workspace = true }
 libvault = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
-ipc-channel = { workspace = true }
 tracing = { workspace = true, features = ["attributes"] }
 tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
 tracing-appender = { workspace = true }
