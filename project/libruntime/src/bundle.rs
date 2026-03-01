@@ -328,7 +328,6 @@ pub async fn mount_and_copy_bundle<P: AsRef<Path>>(
 
     if upper_dir.exists() {
         debug!("{} directory exists deleting...", upper_dir.display());
-        debug!("{} directory exists deleting...", upper_dir.display());
         fs::remove_dir_all(&upper_dir)
             .await
             .with_context(|| format!("failed to delete the dir {upper_dir:?}"))?;

@@ -487,7 +487,7 @@ impl RootfsMount {
 /// Check whether the overlay daemon for a given bundle is still alive.
 ///
 /// Returns a human-readable status string. Useful for debugging.
-/// Usage: `RootfsMount::check_status(bundle_path)`
+/// Usage: `RootfsMount::check_daemon_status(bundle_path)`
 pub fn check_daemon_status(bundle_path: &Path) -> String {
     let metadata_path = bundle_path.join(ROOTFS_MOUNT_METADATA);
     if !metadata_path.exists() {

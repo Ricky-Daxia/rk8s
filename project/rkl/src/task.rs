@@ -850,7 +850,7 @@ impl TaskRunner {
                             pod_sandbox_id, stop_err
                         );
                     } else {
-                        info!(": {}", pod_sandbox_id);
+                        info!("PodSandbox stopped during rollback: {}", pod_sandbox_id);
                     }
 
                     let remove_request = RemovePodSandboxRequest {
